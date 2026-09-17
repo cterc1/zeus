@@ -1,6 +1,7 @@
 'use strict';
 
 const axios = require('axios');
+const https = require('https');
 
 /*
  * Zeus Crypto.com prediction-market connector
@@ -53,6 +54,17 @@ const state = {
 };
 
 let timer = null;
+
+// Render can advertise both IPv6 and IPv4 routes for api.crypto.com even when
+// IPv6 egress is unavailable. Keep DCM traffic on IPv4 so a dead IPv6 route
+// cannot consume the request window. This agent is used only for DCM REST calls.
+const dcmHttpsAgent = new https.Agent({
+    family: 4,
+    keepAlive: true,
+    maxSockets: 4,
+    maxFreeSockets: 2,
+    timeout: 30000
+});
 
 function safeNumber(value, fallback = null) {
     if (value === null || value === undefined || value === '') {
@@ -786,30 +798,48 @@ async function fetchDcmInstruments() {
     async function getWithRetry(url, params, label) {
         let lastError = null;
 
-        for (let attempt = 1; attempt <= 2; attempt += 1) {
+        for (let attempt = 1; attempt <= 3; attempt += 1) {
             try {
                 const response = await axios.get(url, {
                     params,
                     timeout: dcmTimeoutMs,
+                    httpsAgent: dcmHttpsAgent,
                     headers: {
                         Accept: 'application/json',
-                        'Content-Type': 'application/json'
+                        'Content-Type': 'application/json',
+                        Connection: 'keep-alive'
                     }
                 });
 
                 return { response, attempt };
             } catch (error) {
                 lastError = error;
+
+                const code = String(error?.code || '').toUpperCase();
+                const message = String(error?.message || '');
+                const retryableNetworkCodes = new Set([
+                    'ECONNABORTED',
+                    'ETIMEDOUT',
+                    'ECONNRESET',
+                    'ECONNREFUSED',
+                    'ENETUNREACH',
+                    'EHOSTUNREACH',
+                    'EAI_AGAIN'
+                ]);
                 const retryable =
-                    error?.code === 'ECONNABORTED' ||
-                    /timeout/i.test(String(error?.message || '')) ||
+                    retryableNetworkCodes.has(code) ||
+                    /timeout|timed out|ETIMEDOUT|ENETUNREACH|ECONNRESET|EAI_AGAIN/i.test(message) ||
                     Number(error?.response?.status) >= 500;
 
-                if (!retryable || attempt >= 2) {
+                if (!retryable || attempt >= 3) {
                     error.dcmLabel = label;
                     error.dcmAttempt = attempt;
                     throw error;
                 }
+
+                // Short bounded backoff: 500 ms before retry 2, 1.5 s before retry 3.
+                const retryDelayMs = attempt === 1 ? 500 : 1500;
+                await new Promise(resolve => setTimeout(resolve, retryDelayMs));
             }
         }
 
