@@ -48,6 +48,7 @@ const state = {
     instrumentsSeen: 0,
     btcBinaryInstrumentsSeen: 0,
     dcmDiagnostics: null,
+    dcmHttpDiagnostics: null,
     predictionDiagnostics: null
 };
 
@@ -751,66 +752,150 @@ async function pollPredictionApi() {
 
 async function fetchDcmInstruments() {
     /*
-     * DCM is cursor-paginated. Reading only the first page can make the
-     * active BTC 15-minute contract disappear whenever it lands on a later
-     * page. Walk every available page so contract discovery does not depend
-     * on the server's current result ordering.
+     * DIAGNOSTIC-ONLY instrumentation for the DCM fallback.
+     * This does not alter Zeus contract-selection rules. It records the
+     * response shape/status so an empty DCM result can be diagnosed safely.
      */
     const instruments = [];
     const seenCursors = new Set();
+    const pages = [];
     let cursor = null;
     let page = 0;
     const maxPages = 50;
 
-    do {
-        const params = {
-            inst_type: 'BINARY_OPTION',
-            limit: 1000,
-            since: 0
+    state.dcmHttpDiagnostics = {
+        endpoint: `${CONFIG.dcmBaseUrl}/public/get-instruments`,
+        pages: [],
+        totalInstruments: 0,
+        error: null
+    };
+
+    try {
+        do {
+            const params = {
+                inst_type: 'BINARY_OPTION',
+                limit: 1000,
+                since: 0
+            };
+
+            if (cursor) {
+                params.cursor = cursor;
+            }
+
+            const response = await axios.get(
+                `${CONFIG.dcmBaseUrl}/public/get-instruments`,
+                {
+                    params,
+                    timeout: CONFIG.requestTimeoutMs,
+                    headers: { Accept: 'application/json' }
+                }
+            );
+
+            const body = response.data;
+            const result = body?.result || {};
+            const pageData =
+                result.data ||
+                result.instruments ||
+                body?.data ||
+                [];
+
+            const responseKeys =
+                body && typeof body === 'object' && !Array.isArray(body)
+                    ? Object.keys(body)
+                    : [];
+            const resultKeys =
+                result && typeof result === 'object' && !Array.isArray(result)
+                    ? Object.keys(result)
+                    : [];
+
+            const nextCursor =
+                result.next_cursor ||
+                result.nextCursor ||
+                body?.next_cursor ||
+                body?.nextCursor ||
+                null;
+
+            const rawSample = (() => {
+                try {
+                    const source = Array.isArray(pageData) && pageData.length
+                        ? pageData[0]
+                        : body;
+                    const text = JSON.stringify(source);
+                    return text.length > 1800
+                        ? `${text.slice(0, 1800)}...<truncated>`
+                        : text;
+                } catch {
+                    return '[UNSERIALIZABLE_RESPONSE]';
+                }
+            })();
+
+            pages.push({
+                page: page + 1,
+                httpStatus: response.status,
+                responseKeys,
+                resultKeys,
+                responseCode: body?.code ?? body?.id ?? null,
+                responseMessage: body?.message ?? body?.msg ?? null,
+                pageInstrumentCount: Array.isArray(pageData) ? pageData.length : 0,
+                pageDataType: Array.isArray(pageData) ? 'array' : typeof pageData,
+                nextCursor: nextCursor ? String(nextCursor) : null,
+                sample: rawSample
+            });
+
+            if (Array.isArray(pageData)) {
+                instruments.push(...pageData);
+            }
+
+            page += 1;
+
+            if (!nextCursor || seenCursors.has(String(nextCursor))) {
+                cursor = null;
+            } else {
+                seenCursors.add(String(nextCursor));
+                cursor = nextCursor;
+            }
+        } while (cursor && page < maxPages);
+
+        state.dcmHttpDiagnostics = {
+            endpoint: `${CONFIG.dcmBaseUrl}/public/get-instruments`,
+            pages,
+            totalInstruments: instruments.length,
+            error: null
         };
 
-        if (cursor) {
-            params.cursor = cursor;
+        return instruments;
+    } catch (error) {
+        const body = error?.response?.data;
+        let sample = null;
+
+        try {
+            const text = JSON.stringify(body ?? null);
+            sample = text && text.length > 1800
+                ? `${text.slice(0, 1800)}...<truncated>`
+                : text;
+        } catch {
+            sample = '[UNSERIALIZABLE_ERROR_RESPONSE]';
         }
 
-        const response = await axios.get(
-            `${CONFIG.dcmBaseUrl}/public/get-instruments`,
-            {
-                params,
-                timeout: CONFIG.requestTimeoutMs,
-                headers: { Accept: 'application/json' }
+        state.dcmHttpDiagnostics = {
+            endpoint: `${CONFIG.dcmBaseUrl}/public/get-instruments`,
+            pages,
+            totalInstruments: instruments.length,
+            error: {
+                message: error.message,
+                httpStatus: error?.response?.status ?? null,
+                responseKeys:
+                    body && typeof body === 'object' && !Array.isArray(body)
+                        ? Object.keys(body)
+                        : [],
+                responseCode: body?.code ?? body?.id ?? null,
+                responseMessage: body?.message ?? body?.msg ?? null,
+                sample
             }
-        );
+        };
 
-        const result = response.data?.result || {};
-        const pageData =
-            result.data ||
-            result.instruments ||
-            response.data?.data ||
-            [];
-
-        if (Array.isArray(pageData)) {
-            instruments.push(...pageData);
-        }
-
-        const nextCursor =
-            result.next_cursor ||
-            result.nextCursor ||
-            response.data?.next_cursor ||
-            response.data?.nextCursor ||
-            null;
-
-        page += 1;
-
-        if (!nextCursor || seenCursors.has(String(nextCursor))) {
-            cursor = null;
-        } else {
-            seenCursors.add(String(nextCursor));
-            cursor = nextCursor;
-        }
-    } while (cursor && page < maxPages);
-
-    return instruments;
+        throw error;
+    }
 }
 
 function dcmLooksLikeBtc(instrument) {
@@ -935,6 +1020,9 @@ async function pollDcmFallback() {
 
         return candidates[0] || null;
     } catch (error) {
+        state.dcmDiagnostics = {
+            error: error.message
+        };
         return null;
     }
 }
@@ -992,6 +1080,9 @@ async function poll() {
             }
             console.log(`DCM instruments scanned: ${state.instrumentsSeen}`);
             console.log(`DCM BTC binary matches: ${state.btcBinaryInstrumentsSeen}`);
+            if (state.dcmHttpDiagnostics) {
+                console.log(`DCM HTTP diagnostics: ${JSON.stringify(state.dcmHttpDiagnostics)}`);
+            }
             if (state.dcmDiagnostics) {
                 console.log(`DCM rejection summary: ${JSON.stringify(state.dcmDiagnostics)}`);
             }
