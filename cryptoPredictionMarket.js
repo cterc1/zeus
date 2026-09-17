@@ -1,1156 +1,900 @@
 'use strict';
 
+const axios = require('axios');
+
 /*
-============================================================
-                 ZEUS PREDICTION ENGINE
-============================================================
-
-Purpose:
-- Creates paper predictions from the Signal Engine
-- Tracks active predictions
-- Gives every prediction a unique ID
-- Records entry price and entry time
-- Calculates the 15-minute expiration time
-- Resolves predictions using a supplied final price
-- Does NOT place real trades
-
-Flow:
-
-Market Data
-     ↓
-Feature Engine
-     ↓
-Probability Engine
-     ↓
-Signal Engine
-     ↓
-Prediction Engine
-     ↓
-PAPER UP / PAPER DOWN / SKIP
-============================================================
-*/
-
+ * Zeus Crypto.com prediction-market connector
+ *
+ * This module is READ-ONLY. It never places orders.
+ *
+ * Why this version exists:
+ * The older connector queried DCM /public/get-instruments and expected the
+ * active BTC 15-minute strike to be directly exposed on the instrument.
+ * Crypto.com's current public Predictions API separately exposes prediction
+ * EVENTS and their CONTRACTS, so this connector uses that API first and keeps
+ * the DCM instrument endpoint as a secondary fallback.
+ */
 
 const CONFIG = {
-    // Prediction duration
-    predictionDurationMs: 15 * 60 * 1000,
+    pollIntervalMs: 5000,
+    requestTimeoutMs: 10000,
 
-    // Prevent multiple active predictions at once
-    allowMultipleActivePredictions: false,
+    minimumDurationMs: 10 * 60 * 1000,
+    maximumDurationMs: 20 * 60 * 1000,
+    targetDurationMs: 15 * 60 * 1000,
 
-    // Do not create predictions from SKIP signals
-    allowSkipPredictions: false,
+    btcNames: [
+        'BTC',
+        'BTCUSD',
+        'BTCUSDT',
+        'BITCOIN'
+    ],
 
-    // Minimum entry price required
-    minimumPrice: 0
+    predictionsBaseUrl: 'https://data-api.crypto.com/api/v1/predictions',
+    dcmBaseUrl: 'https://api.crypto.com/dcm/v1'
 };
-
-
-// ============================================================
-// INTERNAL STATE
-// ============================================================
 
 const state = {
-    predictions: [],
-    activePrediction: null,
-    nextPredictionNumber: 1
+    running: false,
+    lastPollAt: null,
+    lastSuccessAt: null,
+    lastError: null,
+    activeMarket: null,
+    source: null,
+    eventsSeen: 0,
+    contractsSeen: 0,
+    btcEventsSeen: 0,
+    btcContractsSeen: 0,
+    instrumentsSeen: 0,
+    btcBinaryInstrumentsSeen: 0
 };
 
+let timer = null;
 
-// ============================================================
-// UTILITY FUNCTIONS
-// ============================================================
-
-function safeNumber(value, fallback = 0) {
-    const number = Number(value);
-
-    if (!Number.isFinite(number)) {
+function safeNumber(value, fallback = null) {
+    if (value === null || value === undefined || value === '') {
         return fallback;
     }
 
-    return number;
+    if (typeof value === 'string') {
+        const cleaned = value.replace(/[$,%\s,]/g, '');
+        const n = Number(cleaned);
+        return Number.isFinite(n) ? n : fallback;
+    }
+
+    const n = Number(value);
+    return Number.isFinite(n) ? n : fallback;
 }
 
-
-function round(value, decimals = 8) {
-    const factor = 10 ** decimals;
-
-    return Math.round(value * factor) / factor;
-}
-
-
-function generatePredictionId() {
-    const number =
-        String(state.nextPredictionNumber).padStart(6, '0');
-
-    state.nextPredictionNumber += 1;
-
-    return `ZEUS-${number}`;
-}
-
-
-// ============================================================
-// GET DIRECTION
-// ============================================================
-
-function getDirection(signalResult) {
-    if (!signalResult) {
-        return 'NEUTRAL';
+function parseTime(value) {
+    if (value === null || value === undefined || value === '') {
+        return null;
     }
 
-    const direction =
-        String(signalResult.direction || '').toUpperCase();
-
-    const signal =
-        String(signalResult.signal || '').toUpperCase();
-
-    if (
-        direction === 'UP' ||
-        signal === 'UP'
-    ) {
-        return 'UP';
+    if (value instanceof Date) {
+        const n = value.getTime();
+        return Number.isFinite(n) ? n : null;
     }
 
-    if (
-        direction === 'DOWN' ||
-        signal === 'DOWN'
-    ) {
-        return 'DOWN';
-    }
-
-    return 'NEUTRAL';
-}
-
-
-// ============================================================
-// CREATE PAPER PREDICTION
-// ============================================================
-
-function createPrediction(signalResult, marketSnapshot) {
-    /*
-    Validate signal result
-    */
-
-    if (!signalResult) {
-        return {
-            created: false,
-            reason: 'NO_SIGNAL_RESULT'
-        };
-    }
-
-
-    /*
-    SKIP signals do not become predictions
-    */
-
-    const signal =
-        String(signalResult.signal || '').toUpperCase();
-
-    if (
-        signal === 'SKIP' &&
-        !CONFIG.allowSkipPredictions
-    ) {
-        return {
-            created: false,
-            reason: 'SIGNAL_IS_SKIP'
-        };
-    }
-
-
-    /*
-    Determine direction
-    */
-
-    const direction =
-        getDirection(signalResult);
-
-    if (direction === 'NEUTRAL') {
-        return {
-            created: false,
-            reason: 'DIRECTION_NEUTRAL'
-        };
-    }
-
-
-    /*
-    Prevent duplicate active predictions
-    */
-
-    if (
-        state.activePrediction &&
-        !CONFIG.allowMultipleActivePredictions
-    ) {
-        return {
-            created: false,
-            reason: 'ACTIVE_PREDICTION_ALREADY_EXISTS',
-            activePredictionId:
-                state.activePrediction.id
-        };
-    }
-
-
-    /*
-    Get current market price
-    */
-
-    const price =
-        safeNumber(
-            marketSnapshot?.price,
-            NaN
-        );
-
-    if (
-        !Number.isFinite(price) ||
-        price <= CONFIG.minimumPrice
-    ) {
-        return {
-            created: false,
-            reason: 'INVALID_ENTRY_PRICE'
-        };
-    }
-
-
-    /*
-    Capture timestamps
-    */
-
-    const entryTime = new Date();
-
-    const marketExpiration = marketSnapshot?.cryptoMarket?.closeTime
-        ? new Date(marketSnapshot.cryptoMarket.closeTime)
-        : null;
-
-    const expirationTime =
-        marketExpiration && Number.isFinite(marketExpiration.getTime())
-            ? marketExpiration
-            : new Date(
-                entryTime.getTime() +
-                CONFIG.predictionDurationMs
-            );
-
-
-    /*
-    Create unique ID
-    */
-
-    const id =
-        generatePredictionId();
-
-
-    /*
-    Build prediction
-    */
-
-    const prediction = {
-        id,
-
-        status: 'ACTIVE',
-
-        direction,
-
-        signal: signalResult.signal,
-
-        strength:
-            signalResult.strength || 'UNKNOWN',
-
-        entryPrice: round(price),
-
-        settlementType:
-            marketSnapshot?.cryptoMarket?.strike !== null &&
-            marketSnapshot?.cryptoMarket?.strike !== undefined
-                ? 'CRYPTO_COM_STRIKE'
-                : 'PRICE_DIRECTION',
-
-        strikePrice:
-            marketSnapshot?.cryptoMarket?.strike !== null &&
-            marketSnapshot?.cryptoMarket?.strike !== undefined
-                ? round(Number(marketSnapshot.cryptoMarket.strike), 8)
-                : null,
-
-        strikeOperator:
-            marketSnapshot?.cryptoMarket?.strikeOperator || null,
-
-        cryptoContractSymbol:
-            marketSnapshot?.cryptoMarket?.symbol || null,
-
-        cryptoMarketOpenTime:
-            marketSnapshot?.cryptoMarket?.openTime || null,
-
-        cryptoMarketCloseTime:
-            marketSnapshot?.cryptoMarket?.closeTime || null,
-
-        entryTime:
-            entryTime.toISOString(),
-
-        expirationTime:
-            expirationTime.toISOString(),
-
-        upProbability:
-            safeNumber(
-                signalResult.upProbability,
-                50
-            ),
-
-        downProbability:
-            safeNumber(
-                signalResult.downProbability,
-                50
-            ),
-
-        confidence:
-            safeNumber(
-                signalResult.confidence,
-                0
-            ),
-
-        featureQuality:
-            safeNumber(
-                signalResult.featureQuality,
-                0
-            ),
-
-        dataQuality:
-            safeNumber(
-                signalResult.dataQuality,
-                0
-            ),
-
-        probabilityEdge:
-            safeNumber(
-                signalResult.probabilityEdge,
-                0
-            ),
-
-        conflict:
-            safeNumber(
-                signalResult.conflict,
-                0
-            ),
-
-        reason:
-            signalResult.reason ||
-            'ALL_FILTERS_PASSED',
-
-        exitPrice: null,
-
-        exitTime: null,
-
-        result: null,
-
-        priceChange: null,
-
-        priceChangePercent: null,
-
-        durationMs: null
-    };
-
-
-    /*
-    Store prediction
-    */
-
-    state.predictions.push(prediction);
-
-    state.activePrediction =
-        prediction;
-
-
-    return {
-        created: true,
-        prediction
-    };
-}
-
-
-// ============================================================
-// RESOLVE PREDICTION
-// ============================================================
-
-function resolvePrediction(predictionId, finalPrice, resolutionTime = new Date()) {
-    const prediction =
-        state.predictions.find(
-            item => item.id === predictionId
-        );
-
-
-    if (!prediction) {
-        return {
-            resolved: false,
-            reason: 'PREDICTION_NOT_FOUND'
-        };
-    }
-
-
-    if (prediction.status !== 'ACTIVE') {
-        return {
-            resolved: false,
-            reason: 'PREDICTION_ALREADY_RESOLVED',
-            prediction
-        };
-    }
-
-
-    const exitPrice =
-        safeNumber(
-            finalPrice,
-            NaN
-        );
-
-
-    if (
-        !Number.isFinite(exitPrice) ||
-        exitPrice <= CONFIG.minimumPrice
-    ) {
-        return {
-            resolved: false,
-            reason: 'INVALID_EXIT_PRICE'
-        };
-    }
-
-
-    const exitDate =
-        resolutionTime instanceof Date
-            ? resolutionTime
-            : new Date(resolutionTime);
-
-
-    /*
-    Calculate price movement
-    */
-
-    const priceChange =
-        exitPrice -
-        prediction.entryPrice;
-
-
-    const priceChangePercent =
-        prediction.entryPrice !== 0
-            ? (
-                priceChange /
-                prediction.entryPrice
-            ) * 100
-            : 0;
-
-
-    /*
-    Determine result
-
-    UP wins when final price > entry price.
-
-    DOWN wins when final price < entry price.
-
-    Exact same price = PUSH.
-    */
-
-    let result;
-
-    if (
-        prediction.settlementType === 'CRYPTO_COM_STRIKE' &&
-        Number.isFinite(prediction.strikePrice)
-    ) {
-        const operator = prediction.strikeOperator || '>';
-        let yesOutcome;
-
-        if (operator === '>=') {
-            yesOutcome = exitPrice >= prediction.strikePrice;
-        } else if (operator === '=') {
-            yesOutcome = exitPrice === prediction.strikePrice;
-        } else if (operator === '<=') {
-            yesOutcome = exitPrice <= prediction.strikePrice;
-        } else if (operator === '<') {
-            yesOutcome = exitPrice < prediction.strikePrice;
-        } else {
-            yesOutcome = exitPrice > prediction.strikePrice;
+    if (typeof value === 'number' || /^\d+(?:\.\d+)?$/.test(String(value).trim())) {
+        const n = Number(value);
+
+        if (!Number.isFinite(n)) {
+            return null;
         }
 
-        const predictedYes = prediction.direction === 'UP';
-        result = yesOutcome === predictedYes ? 'WIN' : 'LOSS';
-    } else if (exitPrice > prediction.entryPrice) {
-        result =
-            prediction.direction === 'UP'
-                ? 'WIN'
-                : 'LOSS';
-    } else if (exitPrice < prediction.entryPrice) {
-        result =
-            prediction.direction === 'DOWN'
-                ? 'WIN'
-                : 'LOSS';
-    } else {
-        result = 'PUSH';
+        if (n > 1e17) return n / 1e6;
+        if (n > 1e14) return n / 1e6;
+        if (n > 1e12) return n;
+        if (n > 1e9) return n * 1000;
+
+        return null;
     }
 
+    const text = String(value).trim();
 
-    /*
-    Update prediction
-    */
+    const compact = text.match(
+        /^(\d{4})(\d{2})(\d{2})[-_](\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?$/
+    );
 
-    prediction.status =
-        'RESOLVED';
-
-    prediction.exitPrice =
-        round(exitPrice);
-
-    prediction.exitTime =
-        exitDate.toISOString();
-
-    prediction.result =
-        result;
-
-    prediction.priceChange =
-        round(priceChange);
-
-    prediction.priceChangePercent =
-        round(
-            priceChangePercent,
-            6
-        );
-
-    prediction.durationMs =
-        Math.max(
-            0,
-            exitDate.getTime() -
-            new Date(
-                prediction.entryTime
-            ).getTime()
-        );
-
-
-    /*
-    Clear active prediction
-    */
-
-    if (
-        state.activePrediction &&
-        state.activePrediction.id ===
-        prediction.id
-    ) {
-        state.activePrediction = null;
+    if (compact) {
+        const iso = `${compact[1]}-${compact[2]}-${compact[3]}T${compact[4]}:${compact[5]}:${compact[6]}.${(compact[7] || '000').padEnd(3, '0')}Z`;
+        const parsed = Date.parse(iso);
+        return Number.isFinite(parsed) ? parsed : null;
     }
 
-
-    return {
-        resolved: true,
-        prediction
-    };
+    const parsed = Date.parse(text);
+    return Number.isFinite(parsed) ? parsed : null;
 }
 
+function normalizeSymbol(value) {
+    return String(value || '')
+        .toUpperCase()
+        .replace(/[^A-Z0-9]/g, '');
+}
 
-// ============================================================
-// CHECK FOR EXPIRED PREDICTION
-// ============================================================
+function normalizeText(value) {
+    return String(value || '')
+        .toUpperCase()
+        .replace(/\s+/g, ' ')
+        .trim();
+}
 
-function isPredictionExpired(
-    prediction,
-    now = new Date()
-) {
-    if (!prediction) {
+function isBtcText(value) {
+    const text = normalizeText(value);
+    if (!text) return false;
+
+    return (
+        /\bBTC\b/.test(text) ||
+        /\bBITCOIN\b/.test(text) ||
+        normalizeSymbol(text).includes('BITCOIN') ||
+        normalizeSymbol(text).startsWith('BTC')
+    );
+}
+
+function objectValues(object) {
+    if (!object || typeof object !== 'object') {
+        return [];
+    }
+
+    return Object.entries(object).flatMap(([key, value]) => {
+        if (value && typeof value === 'object') {
+            return [key, ...objectValues(value)];
+        }
+
+        return [key, value];
+    });
+}
+
+function objectEntriesDeep(object, prefix = '') {
+    const output = [];
+
+    if (!object || typeof object !== 'object') {
+        return output;
+    }
+
+    for (const [key, value] of Object.entries(object)) {
+        const path = prefix ? `${prefix}.${key}` : key;
+        output.push({ key, path, value });
+
+        if (value && typeof value === 'object') {
+            output.push(...objectEntriesDeep(value, path));
+        }
+    }
+
+    return output;
+}
+
+function findFirstByKeys(object, keys) {
+    const wanted = new Set(keys.map(key => String(key).toLowerCase()));
+
+    for (const entry of objectEntriesDeep(object)) {
+        if (wanted.has(String(entry.key).toLowerCase())) {
+            if (entry.value !== null && entry.value !== undefined && entry.value !== '') {
+                return entry.value;
+            }
+        }
+    }
+
+    return null;
+}
+
+function findTimeByKeys(object, keys) {
+    const wanted = keys.map(key => String(key).toLowerCase());
+
+    for (const entry of objectEntriesDeep(object)) {
+        const key = String(entry.key).toLowerCase();
+
+        if (!wanted.includes(key)) {
+            continue;
+        }
+
+        const parsed = parseTime(entry.value);
+
+        if (parsed !== null) {
+            return parsed;
+        }
+    }
+
+    return null;
+}
+
+function findStrikeInText(text) {
+    const value = String(text || '');
+
+    const patterns = [
+        /(?:ABOVE|OVER|GREATER THAN|EXCEEDS?|HIGHER THAN|AT LEAST|BELOW|UNDER|LESS THAN|LOWER THAN|AT MOST)[^$0-9]{0,40}\$?\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.\d+)?)/i,
+        /\$\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.\d+)?)/i,
+        /\b([0-9]{2,3}(?:,[0-9]{3})+(?:\.\d+)?)\s*(?:USD|US DOLLARS?)\b/i,
+        /\b(?:BTC|BITCOIN)[^0-9]{0,50}([0-9]{2,3}(?:,[0-9]{3})+(?:\.\d+)?)/i
+    ];
+
+    for (const pattern of patterns) {
+        const match = value.match(pattern);
+
+        if (!match) continue;
+
+        const n = safeNumber(match[1]);
+
+        if (n !== null && n > 1000) {
+            return n;
+        }
+    }
+
+    return null;
+}
+
+function extractStrike(object) {
+    const strikeKeys = [
+        'strike_price',
+        'strikePrice',
+        'strike',
+        'strike_value',
+        'strikeValue',
+        'threshold',
+        'threshold_price',
+        'thresholdPrice',
+        'barrier',
+        'barrier_price',
+        'barrierPrice',
+        'target_price',
+        'targetPrice',
+        'price_threshold',
+        'priceThreshold'
+    ];
+
+    for (const key of strikeKeys) {
+        const value = findFirstByKeys(object, [key]);
+        const n = safeNumber(value);
+
+        if (n !== null && n > 1000) {
+            return n;
+        }
+    }
+
+    for (const entry of objectEntriesDeep(object)) {
+        const key = normalizeText(entry.key);
+
+        if (!/(STRIKE|THRESHOLD|BARRIER|TARGET).*PRICE|STRIKE|THRESHOLD|BARRIER/.test(key)) {
+            continue;
+        }
+
+        const n = safeNumber(entry.value);
+
+        if (n !== null && n > 1000) {
+            return n;
+        }
+    }
+
+    const textValues = objectValues(object)
+        .filter(value => typeof value === 'string')
+        .join(' | ');
+
+    return findStrikeInText(textValues);
+}
+
+function extractOperator(object) {
+    const operatorKeys = [
+        'strike_operator',
+        'strikeOperator',
+        'operator',
+        'comparison_operator',
+        'comparisonOperator',
+        'condition'
+    ];
+
+    for (const key of operatorKeys) {
+        const value = findFirstByKeys(object, [key]);
+
+        if (value !== null) {
+            const text = normalizeText(value);
+
+            if (text.includes('GREATER') || text === 'OVER' || text === 'ABOVE') return '>';
+            if (text.includes('LESS') || text === 'UNDER' || text === 'BELOW') return '<';
+            if (text.includes('EQUAL') || text === 'AT') return '=';
+            if (['>', '>=', '<', '<=', '='].includes(String(value).trim())) {
+                return String(value).trim();
+            }
+        }
+    }
+
+    const text = objectValues(object)
+        .filter(value => typeof value === 'string')
+        .join(' | ')
+        .toUpperCase();
+
+    if (/\b(?:ABOVE|OVER|GREATER THAN|EXCEEDS?|HIGHER THAN)\b/.test(text)) return '>';
+    if (/\b(?:BELOW|UNDER|LESS THAN|LOWER THAN)\b/.test(text)) return '<';
+
+    return null;
+}
+
+function extractOpenClose(object) {
+    const open = findTimeByKeys(object, [
+        'open_time',
+        'openTime',
+        'start_time',
+        'startTime',
+        'opened_at',
+        'openedAt',
+        'market_open_time',
+        'marketOpenTime',
+        'open_timestamp',
+        'openTimestamp'
+    ]);
+
+    const close = findTimeByKeys(object, [
+        'close_time',
+        'closeTime',
+        'end_time',
+        'endTime',
+        'expires_at',
+        'expiresAt',
+        'expiry_time',
+        'expiryTime',
+        'expiration_time',
+        'expirationTime',
+        'expiry_timestamp',
+        'expiryTimestamp',
+        'event_end_date',
+        'eventEndDate'
+    ]);
+
+    return { open, close };
+}
+
+function extractEventDate(object) {
+    return findTimeByKeys(object, [
+        'event_date',
+        'eventDate',
+        'start_time',
+        'startTime',
+        'open_time',
+        'openTime'
+    ]);
+}
+
+function collectText(object) {
+    return objectValues(object)
+        .filter(value => value !== null && value !== undefined)
+        .map(value => String(value))
+        .join(' | ');
+}
+
+function looksLikeBtcEvent(event) {
+    const text = collectText(event);
+
+    return isBtcText(text);
+}
+
+function looksLikeCrypto15MinuteMarket(event, contract = null) {
+    const text = normalizeText(`${collectText(event)} ${collectText(contract || {})}`);
+
+    if (!isBtcText(text)) {
         return false;
     }
 
-    const expiration =
-        new Date(
-            prediction.expirationTime
-        );
-
-    const currentTime =
-        now instanceof Date
-            ? now
-            : new Date(now);
-
     return (
-        currentTime.getTime() >=
-        expiration.getTime()
+        /15\s*(?:MIN|MINS|MINUTE|MINUTES)/.test(text) ||
+        /QUICK|SHORT[- ]TERM|INTRADAY/.test(text) ||
+        /ABOVE|BELOW|OVER|UNDER/.test(text)
     );
 }
 
+function getContractsFromEvent(event) {
+    if (Array.isArray(event?.contracts)) {
+        return event.contracts;
+    }
 
-// ============================================================
-// GET ACTIVE PREDICTION
-// ============================================================
+    if (Array.isArray(event?.contract_list)) {
+        return event.contract_list;
+    }
 
-function getActivePrediction() {
-    return state.activePrediction;
+    if (Array.isArray(event?.contractList)) {
+        return event.contractList;
+    }
+
+    return [];
 }
 
-
-// ============================================================
-// GET PREDICTION BY ID
-// ============================================================
-
-function getPrediction(predictionId) {
+function unwrapData(response) {
     return (
-        state.predictions.find(
-            item =>
-                item.id === predictionId
-        ) || null
+        response?.data?.data ||
+        response?.data?.result?.data ||
+        response?.data?.result ||
+        response?.data ||
+        []
     );
 }
 
-
-// ============================================================
-// GET ALL PREDICTIONS
-// ============================================================
-
-function getPredictions() {
-    return [
-        ...state.predictions
+async function getPredictionEvents() {
+    const urls = [
+        `${CONFIG.predictionsBaseUrl}/events`,
+        `${CONFIG.predictionsBaseUrl}/events/search`
     ];
+
+    const results = [];
+
+    try {
+        const response = await axios.get(urls[0], {
+            params: {
+                status: 'active',
+                limit: 50
+            },
+            timeout: CONFIG.requestTimeoutMs,
+            headers: { Accept: 'application/json' }
+        });
+
+        const data = unwrapData(response);
+
+        if (Array.isArray(data)) {
+            results.push(...data);
+        }
+    } catch (error) {
+        state.lastError = {
+            source: 'PREDICTIONS_EVENTS',
+            message: error.message,
+            timestamp: new Date().toISOString()
+        };
+    }
+
+    // Search is a useful fallback because the active-events list can contain
+    // a broad universe and the BTC contract may not be in the first page.
+    try {
+        const response = await axios.get(urls[1], {
+            params: {
+                q: 'BTC',
+                limit: 50
+            },
+            timeout: CONFIG.requestTimeoutMs,
+            headers: { Accept: 'application/json' }
+        });
+
+        const data = unwrapData(response);
+
+        if (Array.isArray(data)) {
+            results.push(...data);
+        }
+    } catch (error) {
+        // Search failure is not fatal when the main events endpoint worked.
+    }
+
+    const unique = new Map();
+
+    for (const event of results) {
+        const id = event?.id || event?.event_id || event?.eventId || event?.symbol || JSON.stringify(event);
+        unique.set(String(id), event);
+    }
+
+    return [...unique.values()];
 }
 
+async function getEventContracts(eventId) {
+    if (!eventId) return [];
 
-// ============================================================
-// GET PREDICTION HISTORY
-// ============================================================
-
-function getPredictionHistory() {
-    return state.predictions.filter(
-        prediction =>
-            prediction.status ===
-            'RESOLVED'
-    );
-}
-
-
-// ============================================================
-// GET PREDICTION SUMMARY
-// ============================================================
-
-function getPredictionSummary() {
-    const predictions =
-        state.predictions;
-
-
-    const resolved =
-        predictions.filter(
-            prediction =>
-                prediction.status ===
-                'RESOLVED'
+    try {
+        const response = await axios.get(
+            `${CONFIG.predictionsBaseUrl}/events/${encodeURIComponent(eventId)}/contracts`,
+            {
+                timeout: CONFIG.requestTimeoutMs,
+                headers: { Accept: 'application/json' }
+            }
         );
 
+        const data = unwrapData(response);
+        return Array.isArray(data) ? data : [];
+    } catch (error) {
+        return [];
+    }
+}
 
-    const wins =
-        resolved.filter(
-            prediction =>
-                prediction.result ===
-                'WIN'
-        ).length;
+function chooseTimePair(event, contract) {
+    const eventTimes = extractOpenClose(event);
+    const contractTimes = extractOpenClose(contract);
 
+    const open = contractTimes.open ?? eventTimes.open ?? extractEventDate(event);
+    const close = contractTimes.close ?? eventTimes.close;
 
-    const losses =
-        resolved.filter(
-            prediction =>
-                prediction.result ===
-                'LOSS'
-        ).length;
+    return { open, close };
+}
 
+function duration(open, close) {
+    return open != null && close != null && close > open
+        ? close - open
+        : null;
+}
 
-    const pushes =
-        resolved.filter(
-            prediction =>
-                prediction.result ===
-                'PUSH'
-        ).length;
+function isCurrent15m(open, close, now = Date.now()) {
+    if (open == null || close == null) return false;
 
+    const d = close - open;
 
-    const active =
-        predictions.filter(
-            prediction =>
-                prediction.status ===
-                'ACTIVE'
-        ).length;
+    if (d < CONFIG.minimumDurationMs || d > CONFIG.maximumDurationMs) {
+        return false;
+    }
 
+    return now >= open && now < close;
+}
 
-    const totalResolved =
-        wins +
-        losses;
+function scoreCandidate(candidate, now = Date.now()) {
+    const d = duration(candidate.openTimeMs, candidate.closeTimeMs);
+    let score = 0;
 
+    if (candidate.strike !== null) score += 5000;
+    if (candidate.btc) score += 1000;
+    if (candidate.is15mText) score += 1000;
+    if (candidate.openTimeMs != null && candidate.closeTimeMs != null) score += 1000;
 
-    const winRate =
-        totalResolved > 0
-            ? (
-                wins /
-                totalResolved
-            ) * 100
-            : 0;
+    if (d != null) {
+        score -= Math.abs(d - CONFIG.targetDurationMs) / 1000;
+    }
 
+    if (candidate.closeTimeMs != null) {
+        score += Math.min(Math.max(candidate.closeTimeMs - now, 0) / 1000, 900) / 10;
+    }
+
+    return score;
+}
+
+function normalizePredictionMarket(event, contract, now = Date.now()) {
+    const { open, close } = chooseTimePair(event, contract);
+    const combined = {
+        event,
+        contract,
+        metadata: event?.metadata || event?.meta || {}
+    };
+
+    const strike = extractStrike(combined);
+    const strikeOperator = extractOperator(combined);
+
+    const eventId = event?.id || event?.event_id || event?.eventId || null;
+    const contractId = contract?.id || contract?.contract_id || contract?.contractId || null;
+    const symbol = contract?.symbol || contract?.ticker || contract?.code || event?.symbol || null;
+    const title =
+        contract?.title ||
+        contract?.name ||
+        contract?.description ||
+        event?.title ||
+        event?.name ||
+        null;
+
+    const d = duration(open, close);
 
     return {
-        totalPredictions:
-            predictions.length,
-
-        active,
-
-        resolved:
-            resolved.length,
-
-        wins,
-
-        losses,
-
-        pushes,
-
-        winRate:
-            round(winRate, 2)
+        available: true,
+        source: 'CRYPTO.COM_PREDICTIONS_API',
+        eventId,
+        contractId,
+        symbol,
+        displayName: title,
+        title,
+        instrumentType: 'PREDICTION_CONTRACT',
+        underlying: 'BTC',
+        strike,
+        strikeAvailable: strike !== null,
+        strikeOperator,
+        openTime: open != null ? new Date(open).toISOString() : null,
+        closeTime: close != null ? new Date(close).toISOString() : null,
+        openTimestampMs: open,
+        closeTimestampMs: close,
+        durationMs: d,
+        durationMinutes: d != null ? d / 60000 : null,
+        secondsRemaining: close != null
+            ? Math.max(0, Math.ceil((close - now) / 1000))
+            : null,
+        tradable: Boolean(
+            contract?.tradable ??
+            contract?.is_tradable ??
+            contract?.active ??
+            event?.tradable ??
+            true
+        ),
+        status: event?.status || contract?.status || 'active',
+        yesContract: contract?.yes || contract?.outcome === 'YES' || contract?.side === 'YES' ? contract : null,
+        event,
+        contract,
+        raw: combined
     };
 }
 
-
-// ============================================================
-// PRINT PREDICTION REPORT
-// ============================================================
-
-function printPredictionReport(result) {
-    console.log('');
-    console.log('==============================================');
-    console.log('          ZEUS PREDICTION ENGINE');
-    console.log('==============================================');
-
-
-    if (!result) {
-        console.log('No result.');
-        console.log('==============================================');
-        return;
-    }
-
-
-    if (!result.created) {
-        console.log(
-            `Created: NO`
-        );
-
-        console.log(
-            `Reason: ${result.reason}`
-        );
-
-
-        if (result.activePredictionId) {
-            console.log(
-                `Active Prediction: ${
-                    result.activePredictionId
-                }`
-            );
-        }
-
-        console.log('----------------------------------------------');
-        console.log('No prediction created.');
-        console.log('==============================================');
-
-        return;
-    }
-
-
-    const prediction =
-        result.prediction;
-
-
-    console.log(
-        `Created: YES`
-    );
-
-    console.log(
-        `ID: ${prediction.id}`
-    );
-
-    console.log(
-        `Status: ${prediction.status}`
-    );
-
-    console.log(
-        `Direction: ${prediction.direction}`
-    );
-
-    console.log(
-        `Strength: ${prediction.strength}`
-    );
-
-    console.log(
-        `Entry Price: $${prediction.entryPrice}`
-    );
-
-    console.log(
-        `Entry Time: ${prediction.entryTime}`
-    );
-
-    console.log(
-        `Expiration: ${prediction.expirationTime}`
-    );
-
-    console.log(
-        `UP Probability: ${
-            round(
-                prediction.upProbability,
-                2
-            )
-        }%`
-    );
-
-    console.log(
-        `DOWN Probability: ${
-            round(
-                prediction.downProbability,
-                2
-            )
-        }%`
-    );
-
-    console.log(
-        `Confidence: ${
-            round(
-                prediction.confidence,
-                2
-            )
-        }%`
-    );
-
-    console.log(
-        `Feature Quality: ${
-            round(
-                prediction.featureQuality,
-                2
-            )
-        }%`
-    );
-
-    console.log(
-        `Data Quality: ${
-            round(
-                prediction.dataQuality,
-                2
-            )
-        }%`
-    );
-
-    console.log(
-        `Probability Edge: ${
-            round(
-                prediction.probabilityEdge,
-                2
-            )
-        }%`
-    );
-
-    console.log(
-        `Conflict: ${
-            round(
-                prediction.conflict,
-                4
-            )
-        }`
-    );
-
-    console.log(
-        `Reason: ${prediction.reason}`
-    );
-
-    console.log('----------------------------------------------');
-    console.log('PAPER PREDICTION ONLY');
-    console.log('No real trade was placed.');
-    console.log('==============================================');
+function candidateIsUsable(market, now = Date.now()) {
+    if (!market) return false;
+    if (!isCurrent15m(market.openTimestampMs, market.closeTimestampMs, now)) return false;
+    if (market.strike === null) return false;
+    return true;
 }
 
+async function pollPredictionApi() {
+    const now = Date.now();
+    const events = await getPredictionEvents();
 
-// ============================================================
-// TESTS
-// ============================================================
+    state.eventsSeen = events.length;
+    state.btcEventsSeen = events.filter(looksLikeBtcEvent).length;
 
-function runTests() {
-    console.log('==============================================');
-    console.log('       ZEUS PREDICTION ENGINE TEST');
-    console.log('==============================================');
+    const candidates = [];
 
+    for (const event of events) {
+        if (!looksLikeBtcEvent(event)) {
+            continue;
+        }
 
-    /*
-    --------------------------------------------------------
-    TEST 1
-    SKIP signal
-    Expected: no prediction
-    --------------------------------------------------------
-    */
+        const eventId = event?.id || event?.event_id || event?.eventId;
+        let contracts = getContractsFromEvent(event);
 
-    console.log('');
-    console.log('TEST 1: SKIP signal');
+        if (contracts.length === 0 && eventId) {
+            contracts = await getEventContracts(eventId);
+        }
 
-    const test1 =
-        createPrediction(
-            {
-                signal: 'SKIP',
-                direction: 'UP',
+        state.contractsSeen += contracts.length;
+        state.btcContractsSeen += contracts.length;
 
-                upProbability: 72,
-                downProbability: 28,
+        if (contracts.length === 0) {
+            // Some API responses put enough contract information directly on
+            // the event. Treat the event itself as a candidate.
+            contracts = [event];
+        }
 
-                confidence: 34,
+        for (const contract of contracts) {
+            const market = normalizePredictionMarket(event, contract, now);
+            const textMatch = looksLikeCrypto15MinuteMarket(event, contract);
 
-                featureQuality: 85,
-                dataQuality: 90,
-
-                probabilityEdge: 22,
-
-                conflict: 0.10,
-
-                strength: 'WEAK'
-            },
-            {
-                price: 77000
+            if (!textMatch && market.durationMinutes !== 15) {
+                continue;
             }
-        );
 
-    printPredictionReport(test1);
+            const candidate = {
+                ...market,
+                btc: true,
+                is15mText: textMatch
+            };
 
-
-    /*
-    --------------------------------------------------------
-    TEST 2
-    Strong UP signal
-    Expected: prediction created
-    --------------------------------------------------------
-    */
-
-    console.log('');
-    console.log('TEST 2: Strong UP signal');
-
-    const test2 =
-        createPrediction(
-            {
-                signal: 'UP',
-                direction: 'UP',
-
-                upProbability: 81,
-                downProbability: 19,
-
-                confidence: 76,
-
-                featureQuality: 90,
-                dataQuality: 90,
-
-                probabilityEdge: 31,
-
-                conflict: 0.12,
-
-                strength: 'STRONG',
-
-                reason: 'ALL_FILTERS_PASSED'
-            },
-            {
-                price: 77000
+            if (!candidateIsUsable(candidate, now)) {
+                continue;
             }
-        );
 
-    printPredictionReport(test2);
-
-
-    /*
-    --------------------------------------------------------
-    TEST 3
-    Attempt second prediction while first is active
-    Expected: rejected
-    --------------------------------------------------------
-    */
-
-    console.log('');
-    console.log('TEST 3: Duplicate active prediction');
-
-    const test3 =
-        createPrediction(
-            {
-                signal: 'DOWN',
-                direction: 'DOWN',
-
-                upProbability: 20,
-                downProbability: 80,
-
-                confidence: 78,
-
-                featureQuality: 91,
-                dataQuality: 92,
-
-                probabilityEdge: 30,
-
-                conflict: 0.10,
-
-                strength: 'STRONG',
-
-                reason: 'ALL_FILTERS_PASSED'
-            },
-            {
-                price: 77050
-            }
-        );
-
-    printPredictionReport(test3);
-
-
-    /*
-    --------------------------------------------------------
-    TEST 4
-    Resolve first prediction as WIN
-    --------------------------------------------------------
-    */
-
-    console.log('');
-    console.log('TEST 4: Resolve UP prediction as WIN');
-
-    const active =
-        getActivePrediction();
-
-    if (active) {
-        const test4 =
-            resolvePrediction(
-                active.id,
-                77100
-            );
-
-        console.log(
-            `Resolved: ${
-                test4.resolved
-                    ? 'YES'
-                    : 'NO'
-            }`
-        );
-
-        if (test4.prediction) {
-            console.log(
-                `ID: ${
-                    test4.prediction.id
-                }`
-            );
-
-            console.log(
-                `Direction: ${
-                    test4.prediction.direction
-                }`
-            );
-
-            console.log(
-                `Entry Price: $${
-                    test4.prediction.entryPrice
-                }`
-            );
-
-            console.log(
-                `Exit Price: $${
-                    test4.prediction.exitPrice
-                }`
-            );
-
-            console.log(
-                `Result: ${
-                    test4.prediction.result
-                }`
-            );
-
-            console.log(
-                `Price Change: ${
-                    test4.prediction.priceChangePercent
-                }%`
-            );
+            candidate.selectionScore = scoreCandidate(candidate, now);
+            candidates.push(candidate);
         }
     }
 
+    candidates.sort((a, b) => b.selectionScore - a.selectionScore);
 
-    /*
-    --------------------------------------------------------
-    TEST 5
-    Create DOWN prediction after previous one resolved
-    Expected: prediction created
-    --------------------------------------------------------
-    */
-
-    console.log('');
-    console.log('TEST 5: Strong DOWN signal');
-
-    const test5 =
-        createPrediction(
-            {
-                signal: 'DOWN',
-                direction: 'DOWN',
-
-                upProbability: 18,
-                downProbability: 82,
-
-                confidence: 83,
-
-                featureQuality: 94,
-                dataQuality: 95,
-
-                probabilityEdge: 32,
-
-                conflict: 0.08,
-
-                strength: 'EXTREME',
-
-                reason: 'ALL_FILTERS_PASSED'
-            },
-            {
-                price: 77100
-            }
-        );
-
-    printPredictionReport(test5);
-
-
-    /*
-    --------------------------------------------------------
-    FINAL SUMMARY
-    --------------------------------------------------------
-    */
-
-    console.log('');
-    console.log('==============================================');
-    console.log('        PREDICTION ENGINE SUMMARY');
-    console.log('==============================================');
-
-    console.log(
-        getPredictionSummary()
-    );
-
-    console.log('');
-
-    console.log(
-        'Prediction engine test complete.'
-    );
-
-    console.log(
-        'No real trades were placed.'
-    );
-
-    console.log('==============================================');
+    return candidates[0] || null;
 }
 
+async function fetchDcmInstruments() {
+    const response = await axios.get(
+        `${CONFIG.dcmBaseUrl}/public/get-instruments`,
+        {
+            params: {
+                inst_type: 'BINARY_OPTION',
+                limit: 1000
+            },
+            timeout: CONFIG.requestTimeoutMs,
+            headers: { Accept: 'application/json' }
+        }
+    );
 
-// ============================================================
-// EXPORTS
-// ============================================================
+    return (
+        response.data?.result?.data ||
+        response.data?.result?.instruments ||
+        response.data?.data ||
+        []
+    );
+}
+
+function dcmLooksLikeBtc(instrument) {
+    const values = [
+        instrument?.base_ccy,
+        instrument?.base_currency,
+        instrument?.underlying_symbol,
+        instrument?.symbol,
+        instrument?.display_name,
+        instrument?.event_symbol,
+        instrument?.event_details?.eventName,
+        instrument?.event_details?.metaData?.NAME,
+        instrument?.event_details?.metaData?.UNDERLYING
+    ].filter(Boolean);
+
+    return values.some(isBtcText);
+}
+
+function dcmIsBinaryOption(instrument) {
+    const type = normalizeText(
+        instrument?.inst_type ||
+        instrument?.instrument_type ||
+        instrument?.security_sub_type ||
+        instrument?.event_details?.metaData?.PREDICT_CONTRACT_TYPE ||
+        ''
+    );
+
+    return type === 'BINARY_OPTION' || type.includes('BINARY');
+}
+
+function normalizeDcmMarket(instrument, now = Date.now()) {
+    const { open, close } = extractOpenClose(instrument);
+    const strike = extractStrike(instrument);
+    const d = duration(open, close);
+
+    return {
+        available: true,
+        source: 'CRYPTO.COM_DCM',
+        eventId: instrument?.event_symbol || instrument?.event_id || null,
+        contractId: instrument?.symbol || null,
+        symbol: instrument?.symbol || null,
+        displayName: instrument?.display_name || null,
+        title: instrument?.display_name || null,
+        instrumentType: instrument?.inst_type || 'BINARY_OPTION',
+        underlying: instrument?.underlying_symbol || instrument?.base_ccy || 'BTC',
+        strike,
+        strikeAvailable: strike !== null,
+        strikeOperator: extractOperator(instrument),
+        strikeIndex: instrument?.attributes?.STRIKE_INDEX || instrument?.strike_index || null,
+        openTime: open != null ? new Date(open).toISOString() : null,
+        closeTime: close != null ? new Date(close).toISOString() : null,
+        openTimestampMs: open,
+        closeTimestampMs: close,
+        durationMs: d,
+        durationMinutes: d != null ? d / 60000 : null,
+        secondsRemaining: close != null
+            ? Math.max(0, Math.ceil((close - now) / 1000))
+            : null,
+        tradable: Boolean(instrument?.tradable),
+        status: instrument?.status || 'active',
+        metadata: instrument?.event_details?.metaData || {},
+        raw: instrument
+    };
+}
+
+async function pollDcmFallback() {
+    try {
+        const instruments = await fetchDcmInstruments();
+        const now = Date.now();
+
+        state.instrumentsSeen = instruments.length;
+        state.btcBinaryInstrumentsSeen = instruments.filter(
+            instrument => dcmIsBinaryOption(instrument) && dcmLooksLikeBtc(instrument)
+        ).length;
+
+        const candidates = instruments
+            .filter(instrument => {
+                if (!instrument?.tradable) return false;
+                if (!dcmIsBinaryOption(instrument)) return false;
+                if (!dcmLooksLikeBtc(instrument)) return false;
+
+                const market = normalizeDcmMarket(instrument, now);
+
+                return (
+                    isCurrent15m(market.openTimestampMs, market.closeTimestampMs, now) &&
+                    market.strike !== null
+                );
+            })
+            .map(instrument => normalizeDcmMarket(instrument, now));
+
+        candidates.sort((a, b) => {
+            const ad = a.durationMs == null ? Infinity : Math.abs(a.durationMs - CONFIG.targetDurationMs);
+            const bd = b.durationMs == null ? Infinity : Math.abs(b.durationMs - CONFIG.targetDurationMs);
+            return ad - bd;
+        });
+
+        return candidates[0] || null;
+    } catch (error) {
+        return null;
+    }
+}
+
+async function poll() {
+    state.lastPollAt = new Date().toISOString();
+    state.contractsSeen = 0;
+    state.btcContractsSeen = 0;
+
+    try {
+        let market = null;
+
+        try {
+            market = await pollPredictionApi();
+        } catch (error) {
+            state.lastError = {
+                source: 'PREDICTIONS_API',
+                message: error.message,
+                timestamp: new Date().toISOString()
+            };
+        }
+
+        if (!market) {
+            market = await pollDcmFallback();
+        }
+
+        state.activeMarket = market;
+        state.source = market?.source || null;
+        state.lastSuccessAt = new Date().toISOString();
+
+        if (market) {
+            state.lastError = null;
+
+            console.log('');
+            console.log('========== CRYPTO.COM MARKET =========');
+            console.log(`Source: ${market.source}`);
+            console.log(`Contract: ${market.symbol || market.contractId || 'UNKNOWN'}`);
+            console.log(`Title: ${market.title || market.displayName || 'UNKNOWN'}`);
+            console.log(`BTC Strike: ${market.strike !== null ? `$${market.strike.toFixed(2)}` : 'NOT EXPOSED BY FEED'}`);
+            console.log(`Operator: ${market.strikeOperator || 'UNKNOWN'}`);
+            console.log(`Open: ${market.openTime || 'UNKNOWN'}`);
+            console.log(`Close: ${market.closeTime || 'UNKNOWN'}`);
+            console.log(`Strike Available: ${market.strikeAvailable ? 'YES' : 'NO'}`);
+            console.log('========================================');
+        } else {
+            console.log('');
+            console.log('========== CRYPTO.COM MARKET =========');
+            console.log('Status: ACTIVE BTC 15-MINUTE CONTRACT NOT FOUND');
+            console.log(`Prediction events scanned: ${state.eventsSeen}`);
+            console.log(`BTC events found: ${state.btcEventsSeen}`);
+            console.log(`Contracts scanned: ${state.contractsSeen}`);
+            console.log('Decision: WAITING FOR AN ACTUAL CONTRACT + STRIKE');
+            console.log('========================================');
+        }
+    } catch (error) {
+        state.lastError = {
+            source: 'CRYPTO_COM_MARKET',
+            message: error.message,
+            timestamp: new Date().toISOString()
+        };
+
+        console.error('Crypto.com market-data error:', error.message);
+    }
+}
+
+function start() {
+    if (state.running) return;
+
+    state.running = true;
+
+    console.log('Crypto.com 15-minute market feed starting...');
+    console.log(`Predictions API: ${CONFIG.predictionsBaseUrl}`);
+    console.log(`DCM fallback: ${CONFIG.dcmBaseUrl}/public/get-instruments`);
+    console.log('Mode: READ-ONLY / PAPER');
+
+    poll();
+    timer = setInterval(poll, CONFIG.pollIntervalMs);
+}
+
+function stop() {
+    state.running = false;
+
+    if (timer) {
+        clearInterval(timer);
+        timer = null;
+    }
+}
+
+function getMarket() {
+    return state.activeMarket;
+}
+
+function getStatus() {
+    return {
+        connected: Boolean(state.lastSuccessAt),
+        running: state.running,
+        lastPollAt: state.lastPollAt,
+        lastSuccessAt: state.lastSuccessAt,
+        lastError: state.lastError,
+        source: state.source,
+        eventsSeen: state.eventsSeen,
+        contractsSeen: state.contractsSeen,
+        btcEventsSeen: state.btcEventsSeen,
+        btcContractsSeen: state.btcContractsSeen,
+        instrumentsSeen: state.instrumentsSeen,
+        btcBinaryInstrumentsSeen: state.btcBinaryInstrumentsSeen,
+        market: state.activeMarket
+    };
+}
 
 module.exports = {
     CONFIG,
-
-    createPrediction,
-
-    resolvePrediction,
-
-    isPredictionExpired,
-
-    getActivePrediction,
-
-    getPrediction,
-
-    getPredictions,
-
-    getPredictionHistory,
-
-    getPredictionSummary,
-
-    printPredictionReport,
-
-    state
+    state,
+    start,
+    stop,
+    poll,
+    getMarket,
+    getStatus
 };
-
-
-// ============================================================
-// STANDALONE TEST
-// ============================================================
-
-if (require.main === module) {
-    runTests();
-}

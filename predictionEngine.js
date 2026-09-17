@@ -1,2503 +1,1156 @@
-// ============================================================
-// ZEUS PROBABILITY ENGINE
-// ============================================================
-// Converts Zeus market features into:
-//   - UP probability
-//   - DOWN probability
-//   - confidence
-//   - signal
-//   - transparent component scores
-//
-// IMPORTANT:
-// This is a model score, NOT a guaranteed probability of profit.
-// It must be backtested and calibrated before real-money use.
-// ============================================================
+'use strict';
+
+/*
+============================================================
+                 ZEUS PREDICTION ENGINE
+============================================================
+
+Purpose:
+- Creates paper predictions from the Signal Engine
+- Tracks active predictions
+- Gives every prediction a unique ID
+- Records entry price and entry time
+- Calculates the 15-minute expiration time
+- Resolves predictions using a supplied final price
+- Does NOT place real trades
+
+Flow:
+
+Market Data
+     ↓
+Feature Engine
+     ↓
+Probability Engine
+     ↓
+Signal Engine
+     ↓
+Prediction Engine
+     ↓
+PAPER UP / PAPER DOWN / SKIP
+============================================================
+*/
+
 
 const CONFIG = {
-    // --------------------------------------------------------
-    // Signal thresholds
-    // --------------------------------------------------------
+    // Prediction duration
+    predictionDurationMs: 15 * 60 * 1000,
 
-    minimumFeatureQuality: 60,
+    // Prevent multiple active predictions at once
+    allowMultipleActivePredictions: false,
 
-    minimumConfidenceForSignal: 58,
+    // Do not create predictions from SKIP signals
+    allowSkipPredictions: false,
 
-    strongConfidence: 70,
-
-    extremeConfidence: 82,
-
-    // --------------------------------------------------------
-    // Probability limits
-    // --------------------------------------------------------
-
-    minimumProbability: 5,
-
-    maximumProbability: 95,
-
-    // --------------------------------------------------------
-    // Component weights
-    // --------------------------------------------------------
-
-    weights: {
-        momentum: 0.24,
-        orderBook: 0.22,
-        tradePressure: 0.24,
-        volatility: 0.10,
-        microstructure: 0.10,
-        trend: 0.10
-    },
-
-    // --------------------------------------------------------
-    // Conflict penalty
-    // --------------------------------------------------------
-
-    conflictPenalty: 0.12,
-
-    // --------------------------------------------------------
-    // Small neutral zone
-    // --------------------------------------------------------
-
-    neutralZone: 0.04
+    // Minimum entry price required
+    minimumPrice: 0
 };
 
+
 // ============================================================
-// UTILITY
+// INTERNAL STATE
 // ============================================================
 
-function clamp(value, min, max) {
-    return Math.max(
-        min,
-        Math.min(max, value)
-    );
-}
+const state = {
+    predictions: [],
+    activePrediction: null,
+    nextPredictionNumber: 1
+};
+
+
+// ============================================================
+// UTILITY FUNCTIONS
+// ============================================================
 
 function safeNumber(value, fallback = 0) {
     const number = Number(value);
 
-    return Number.isFinite(number)
-        ? number
-        : fallback;
-}
-
-function finiteOrNull(value) {
-    const number = Number(value);
-
-    return Number.isFinite(number)
-        ? number
-        : null;
-}
-
-function round(value, decimals = 4) {
-    if (!Number.isFinite(value)) {
-        return null;
+    if (!Number.isFinite(number)) {
+        return fallback;
     }
 
-    const multiplier =
-        Math.pow(10, decimals);
-
-    return (
-        Math.round(
-            value * multiplier
-        ) / multiplier
-    );
+    return number;
 }
 
-// ============================================================
-// FEATURE EXTRACTION
-// ============================================================
 
-function getFeatureContainer(snapshot) {
-    if (
-        snapshot &&
-        snapshot.features
-    ) {
-        return snapshot.features;
-    }
+function round(value, decimals = 8) {
+    const factor = 10 ** decimals;
 
-    return {};
+    return Math.round(value * factor) / factor;
 }
 
-function getOrderBook(snapshot) {
-    if (
-        snapshot &&
-        snapshot.orderBook
-    ) {
-        return snapshot.orderBook;
-    }
 
-    return {};
-}
-
-function getTrades(snapshot) {
-    if (
-        snapshot &&
-        snapshot.trades
-    ) {
-        return snapshot.trades;
-    }
-
-    return {};
-}
-
-function getMovements(snapshot) {
-    if (
-        snapshot &&
-        snapshot.movements
-    ) {
-        return snapshot.movements;
-    }
-
-    return {};
-}
-
-function getVolatility(snapshot) {
-    if (
-        snapshot &&
-        snapshot.volatility
-    ) {
-        return snapshot.volatility;
-    }
-
-    return {};
-}
-
-// ============================================================
-// NORMALIZATION
-// ============================================================
-
-function normalizeRange(
-    value,
-    negativeLimit,
-    positiveLimit
-) {
+function generatePredictionId() {
     const number =
-        finiteOrNull(value);
+        String(state.nextPredictionNumber).padStart(6, '0');
 
-    if (number === null) {
-        return 0;
-    }
+    state.nextPredictionNumber += 1;
 
-    if (
-        number >= positiveLimit
-    ) {
-        return 1;
-    }
-
-    if (
-        number <= negativeLimit
-    ) {
-        return -1;
-    }
-
-    if (number >= 0) {
-        return (
-            number /
-            positiveLimit
-        );
-    }
-
-    return (
-        number /
-        Math.abs(negativeLimit)
-    );
+    return `ZEUS-${number}`;
 }
 
+
 // ============================================================
-// MOMENTUM SCORE
+// GET DIRECTION
 // ============================================================
 
-function calculateMomentumScore(
-    snapshot
-) {
-    const features =
-        getFeatureContainer(
-            snapshot
-        );
+function getDirection(signalResult) {
+    if (!signalResult) {
+        return 'NEUTRAL';
+    }
 
-    const movements =
-        getMovements(snapshot);
+    const direction =
+        String(signalResult.direction || '').toUpperCase();
 
-    const movement15 =
-        finiteOrNull(
-            features.momentum15 ??
-            features.movement15 ??
-            movements[15]
-        );
+    const signal =
+        String(signalResult.signal || '').toUpperCase();
 
-    const movement30 =
-        finiteOrNull(
-            features.momentum30 ??
-            features.movement30 ??
-            movements[30]
-        );
+    if (
+        direction === 'UP' ||
+        signal === 'UP'
+    ) {
+        return 'UP';
+    }
 
-    const movement60 =
-        finiteOrNull(
-            features.momentum60 ??
-            features.movement60 ??
-            movements[60]
-        );
+    if (
+        direction === 'DOWN' ||
+        signal === 'DOWN'
+    ) {
+        return 'DOWN';
+    }
 
-    const movement180 =
-        finiteOrNull(
-            features.momentum180 ??
-            features.movement180 ??
-            movements[180]
-        );
+    return 'NEUTRAL';
+}
 
-    const movement300 =
-        finiteOrNull(
-            features.momentum300 ??
-            features.movement300 ??
-            movements[300]
-        );
 
-    const values = [
-        movement15,
-        movement30,
-        movement60,
-        movement180,
-        movement300
-    ].filter(
-        value =>
-            value !== null
-    );
+// ============================================================
+// CREATE PAPER PREDICTION
+// ============================================================
 
-    if (values.length === 0) {
+function createPrediction(signalResult, marketSnapshot) {
+    /*
+    Validate signal result
+    */
+
+    if (!signalResult) {
         return {
-            score: 0,
-            confidence: 0,
-            direction: "NEUTRAL",
-            components: {
-                movement15,
-                movement30,
-                movement60,
-                movement180,
-                movement300
-            }
+            created: false,
+            reason: 'NO_SIGNAL_RESULT'
         };
     }
 
-    const weightedValues = [];
 
-    if (movement15 !== null) {
-        weightedValues.push({
-            value: movement15,
-            weight: 0.30
-        });
-    }
+    /*
+    SKIP signals do not become predictions
+    */
 
-    if (movement30 !== null) {
-        weightedValues.push({
-            value: movement30,
-            weight: 0.25
-        });
-    }
+    const signal =
+        String(signalResult.signal || '').toUpperCase();
 
-    if (movement60 !== null) {
-        weightedValues.push({
-            value: movement60,
-            weight: 0.20
-        });
-    }
-
-    if (movement180 !== null) {
-        weightedValues.push({
-            value: movement180,
-            weight: 0.15
-        });
-    }
-
-    if (movement300 !== null) {
-        weightedValues.push({
-            value: movement300,
-            weight: 0.10
-        });
-    }
-
-    let weightedMomentum = 0;
-    let totalWeight = 0;
-
-    for (const item of weightedValues) {
-        weightedMomentum +=
-            normalizeRange(
-                item.value,
-                -0.10,
-                0.10
-            ) *
-            item.weight;
-
-        totalWeight += item.weight;
-    }
-
-    if (totalWeight > 0) {
-        weightedMomentum /=
-            totalWeight;
-    }
-
-    const acceleration =
-        finiteOrNull(
-            features.shortTermAcceleration ??
-            features.momentumAcceleration ??
-            features.acceleration
-        );
-
-    let accelerationScore = 0;
-
-    if (acceleration !== null) {
-        accelerationScore =
-            normalizeRange(
-                acceleration,
-                -0.10,
-                0.10
-            );
-    }
-
-    const score =
-        clamp(
-            weightedMomentum * 0.75 +
-            accelerationScore * 0.25,
-            -1,
-            1
-        );
-
-    const confidence =
-        Math.abs(score) * 100;
-
-    let direction = "NEUTRAL";
-
-    if (score > 0.05) {
-        direction = "UP";
-    } else if (score < -0.05) {
-        direction = "DOWN";
-    }
-
-    return {
-        score,
-        confidence,
-        direction,
-
-        components: {
-            movement15,
-            movement30,
-            movement60,
-            movement180,
-            movement300,
-            acceleration
-        }
-    };
-}
-
-// ============================================================
-// ORDER BOOK SCORE
-// ============================================================
-
-function calculateOrderBookScore(
-    snapshot
-) {
-    const features =
-        getFeatureContainer(
-            snapshot
-        );
-
-    const orderBook =
-        getOrderBook(snapshot);
-
-    const combined =
-        orderBook.combined ||
-        {};
-
-    const imbalance =
-        finiteOrNull(
-            features.orderBookImbalance ??
-            features.bookImbalance ??
-            combined.imbalance
-        );
-
-    const imbalance5 =
-        finiteOrNull(
-            features.imbalance5 ??
-            features.fiveLevelImbalance
-        );
-
-    const imbalance10 =
-        finiteOrNull(
-            features.imbalance10 ??
-            features.tenLevelImbalance
-        );
-
-    const imbalance25 =
-        finiteOrNull(
-            features.imbalance25 ??
-            features.twentyFiveLevelImbalance
-        );
-
-    const values = [];
-
-    if (imbalance !== null) {
-        values.push({
-            value: imbalance,
-            weight: 0.20
-        });
-    }
-
-    if (imbalance5 !== null) {
-        values.push({
-            value: imbalance5,
-            weight: 0.35
-        });
-    }
-
-    if (imbalance10 !== null) {
-        values.push({
-            value: imbalance10,
-            weight: 0.30
-        });
-    }
-
-    if (imbalance25 !== null) {
-        values.push({
-            value: imbalance25,
-            weight: 0.15
-        });
-    }
-
-    if (values.length === 0) {
+    if (
+        signal === 'SKIP' &&
+        !CONFIG.allowSkipPredictions
+    ) {
         return {
-            score: 0,
-            confidence: 0,
-            direction: "NEUTRAL",
-            components: {
-                imbalance,
-                imbalance5,
-                imbalance10,
-                imbalance25
-            }
+            created: false,
+            reason: 'SIGNAL_IS_SKIP'
         };
     }
 
-    let score = 0;
-    let totalWeight = 0;
 
-    for (const item of values) {
-        score +=
-            clamp(
-                safeNumber(
-                    item.value
-                ),
-                -1,
-                1
-            ) *
-            item.weight;
+    /*
+    Determine direction
+    */
 
-        totalWeight +=
-            item.weight;
+    const direction =
+        getDirection(signalResult);
+
+    if (direction === 'NEUTRAL') {
+        return {
+            created: false,
+            reason: 'DIRECTION_NEUTRAL'
+        };
     }
 
-    if (totalWeight > 0) {
-        score /=
-            totalWeight;
-    }
 
-    score =
-        clamp(
-            score,
-            -1,
-            1
-        );
-
-    let direction = "NEUTRAL";
-
-    if (score > 0.05) {
-        direction = "UP";
-    } else if (score < -0.05) {
-        direction = "DOWN";
-    }
-
-    return {
-        score,
-        confidence:
-            Math.abs(score) * 100,
-        direction,
-
-        components: {
-            imbalance,
-            imbalance5,
-            imbalance10,
-            imbalance25
-        }
-    };
-}
-
-// ============================================================
-// TRADE PRESSURE SCORE
-// ============================================================
-
-function getTradeWindow(
-    snapshot,
-    seconds
-) {
-    const features =
-        getFeatureContainer(
-            snapshot
-        );
-
-    const trades =
-        getTrades(snapshot);
-
-    const recent =
-        trades[
-            `recent${seconds}s`
-        ];
-
-    if (recent) {
-        return recent;
-    }
-
-    const featureWindow =
-        features[
-            `tradePressure${seconds}s`
-        ];
-
-    if (featureWindow) {
-        return featureWindow;
-    }
+    /*
+    Prevent duplicate active predictions
+    */
 
     if (
-        seconds === 60 &&
-        trades.recent60s
+        state.activePrediction &&
+        !CONFIG.allowMultipleActivePredictions
     ) {
-        return trades.recent60s;
+        return {
+            created: false,
+            reason: 'ACTIVE_PREDICTION_ALREADY_EXISTS',
+            activePredictionId:
+                state.activePrediction.id
+        };
     }
 
-    return null;
-}
 
-function calculateTradePressureScore(
-    snapshot
-) {
-    const features =
-        getFeatureContainer(
-            snapshot
+    /*
+    Get current market price
+    */
+
+    const price =
+        safeNumber(
+            marketSnapshot?.price,
+            NaN
         );
 
-    const windows = [
-        {
-            seconds: 15,
-            weight: 0.30
-        },
-        {
-            seconds: 30,
-            weight: 0.30
-        },
-        {
-            seconds: 60,
-            weight: 0.40
-        }
-    ];
+    if (
+        !Number.isFinite(price) ||
+        price <= CONFIG.minimumPrice
+    ) {
+        return {
+            created: false,
+            reason: 'INVALID_ENTRY_PRICE'
+        };
+    }
 
-    let score = 0;
-    let totalWeight = 0;
 
-    const components = {};
+    /*
+    Capture timestamps
+    */
 
-    for (const window of windows) {
-        const data =
-            getTradeWindow(
-                snapshot,
-                window.seconds
+    const entryTime = new Date();
+
+    const marketExpiration = marketSnapshot?.cryptoMarket?.closeTime
+        ? new Date(marketSnapshot.cryptoMarket.closeTime)
+        : null;
+
+    const expirationTime =
+        marketExpiration && Number.isFinite(marketExpiration.getTime())
+            ? marketExpiration
+            : new Date(
+                entryTime.getTime() +
+                CONFIG.predictionDurationMs
             );
 
-        let imbalance = null;
 
-        if (data) {
-            imbalance =
-                finiteOrNull(
-                    data.imbalance ??
-                    data.tradeImbalance
-                );
-        }
+    /*
+    Create unique ID
+    */
 
-        if (
-            imbalance === null
-        ) {
-            imbalance =
-                finiteOrNull(
-                    features[
-                        `tradeImbalance${window.seconds}`
-                    ]
-                );
-        }
+    const id =
+        generatePredictionId();
 
-        components[
-            `${window.seconds}s`
-        ] = imbalance;
 
-        if (
-            imbalance === null
-        ) {
-            continue;
-        }
+    /*
+    Build prediction
+    */
 
-        score +=
-            clamp(
-                imbalance,
-                -1,
-                1
-            ) *
-            window.weight;
+    const prediction = {
+        id,
 
-        totalWeight +=
-            window.weight;
-    }
-
-    if (totalWeight > 0) {
-        score /=
-            totalWeight;
-    }
-
-    score =
-        clamp(
-            score,
-            -1,
-            1
-        );
-
-    let direction = "NEUTRAL";
-
-    if (score > 0.05) {
-        direction = "UP";
-    } else if (score < -0.05) {
-        direction = "DOWN";
-    }
-
-    return {
-        score,
-        confidence:
-            Math.abs(score) * 100,
-        direction,
-        components
-    };
-}
-
-// ============================================================
-// VOLATILITY SCORE
-// ============================================================
-
-function calculateVolatilityScore(
-    snapshot
-) {
-    const features =
-        getFeatureContainer(
-            snapshot
-        );
-
-    const volatility =
-        getVolatility(snapshot);
-
-    const volatility15 =
-        finiteOrNull(
-            features.realizedVolatility15 ??
-            features.volatility15 ??
-            volatility.realized15s
-        );
-
-    const volatility30 =
-        finiteOrNull(
-            features.realizedVolatility30 ??
-            features.volatility30 ??
-            volatility.realized30s
-        );
-
-    const volatility60 =
-        finiteOrNull(
-            features.realizedVolatility60 ??
-            features.volatility60 ??
-            volatility.realized60s
-        );
-
-    const values = [
-        volatility15,
-        volatility30,
-        volatility60
-    ].filter(
-        value =>
-            value !== null
-    );
-
-    if (values.length === 0) {
-        return {
-            score: 0,
-            confidence: 0,
-            direction: "NEUTRAL",
-            regime: "UNKNOWN",
-            components: {
-                volatility15,
-                volatility30,
-                volatility60
-            }
-        };
-    }
-
-    const average =
-        values.reduce(
-            (sum, value) =>
-                sum + value,
-            0
-        ) /
-        values.length;
-
-    const lowThreshold =
-        0.00001;
-
-    const highThreshold =
-        0.00010;
-
-    let regime;
-    let confidence;
-
-    if (
-        average <
-        lowThreshold
-    ) {
-        regime = "LOW";
-        confidence = 35;
-    } else if (
-        average >
-        highThreshold
-    ) {
-        regime = "HIGH";
-        confidence = 45;
-    } else {
-        regime = "NORMAL";
-        confidence = 80;
-    }
-
-    return {
-        score: 0,
-
-        confidence,
-
-        direction: "NEUTRAL",
-
-        regime,
-
-        components: {
-            volatility15,
-            volatility30,
-            volatility60,
-            average
-        }
-    };
-}
-
-// ============================================================
-// MICROSTRUCTURE SCORE
-// ============================================================
-
-function calculateMicrostructureScore(
-    snapshot
-) {
-    const features =
-        getFeatureContainer(
-            snapshot
-        );
-
-    const orderBook =
-        getOrderBook(snapshot);
-
-    const coinbase =
-        orderBook.coinbase ||
-        {};
-
-    const kraken =
-        orderBook.kraken ||
-        {};
-
-    const spread =
-        finiteOrNull(
-            features.averageSpreadPercent ??
-            features.averageSpreadPct ??
-            features.spreadPercent
-        );
-
-    const exchangeDifference =
-        finiteOrNull(
-            features.crossExchangeDifferencePercent ??
-            features.crossExchangeDifferencePct ??
-            features.exchangeDifferencePercent
-        );
-
-    const coinbaseSpread =
-        finiteOrNull(
-            features.coinbaseSpread ??
-            coinbase.spread
-        );
-
-    const krakenSpread =
-        finiteOrNull(
-            features.krakenSpread ??
-            kraken.spread
-        );
-
-    let quality = 70;
-
-    if (
-        spread !== null
-    ) {
-        if (
-            spread <
-            0.001
-        ) {
-            quality += 15;
-        } else if (
-            spread >
-            0.01
-        ) {
-            quality -= 15;
-        }
-    }
-
-    if (
-        exchangeDifference !== null
-    ) {
-        const absoluteDifference =
-            Math.abs(
-                exchangeDifference
-            );
-
-        if (
-            absoluteDifference <
-            0.005
-        ) {
-            quality += 10;
-        } else if (
-            absoluteDifference >
-            0.05
-        ) {
-            quality -= 20;
-        }
-    }
-
-    quality =
-        clamp(
-            quality,
-            0,
-            100
-        );
-
-    return {
-        score: 0,
-
-        confidence: quality,
-
-        direction: "NEUTRAL",
-
-        components: {
-            averageSpreadPercent:
-                spread,
-
-            exchangeDifferencePercent:
-                exchangeDifference,
-
-            coinbaseSpread,
-
-            krakenSpread
-        }
-    };
-}
-
-// ============================================================
-// TREND SCORE
-// ============================================================
-
-function calculateTrendScore(
-    snapshot
-) {
-    const features =
-        getFeatureContainer(
-            snapshot
-        );
-
-    const movements =
-        getMovements(snapshot);
-
-    const movement30 =
-        finiteOrNull(
-            features.momentum30 ??
-            features.movement30 ??
-            movements[30]
-        );
-
-    const movement60 =
-        finiteOrNull(
-            features.momentum60 ??
-            features.movement60 ??
-            movements[60]
-        );
-
-    const movement180 =
-        finiteOrNull(
-            features.momentum180 ??
-            features.movement180 ??
-            movements[180]
-        );
-
-    if (
-        movement30 === null &&
-        movement60 === null &&
-        movement180 === null
-    ) {
-        return {
-            score: 0,
-            confidence: 0,
-            direction: "NEUTRAL",
-            components: {
-                movement30,
-                movement60,
-                movement180
-            }
-        };
-    }
-
-    let score = 0;
-    let weight = 0;
-
-    if (movement30 !== null) {
-        score +=
-            normalizeRange(
-                movement30,
-                -0.10,
-                0.10
-            ) *
-            0.35;
-
-        weight += 0.35;
-    }
-
-    if (movement60 !== null) {
-        score +=
-            normalizeRange(
-                movement60,
-                -0.10,
-                0.10
-            ) *
-            0.40;
-
-        weight += 0.40;
-    }
-
-    if (movement180 !== null) {
-        score +=
-            normalizeRange(
-                movement180,
-                -0.15,
-                0.15
-            ) *
-            0.25;
-
-        weight += 0.25;
-    }
-
-    if (weight > 0) {
-        score /=
-            weight;
-    }
-
-    score =
-        clamp(
-            score,
-            -1,
-            1
-        );
-
-    let direction = "NEUTRAL";
-
-    if (score > 0.05) {
-        direction = "UP";
-    } else if (score < -0.05) {
-        direction = "DOWN";
-    }
-
-    return {
-        score,
-
-        confidence:
-            Math.abs(score) * 100,
+        status: 'ACTIVE',
 
         direction,
 
-        components: {
-            movement30,
-            movement60,
-            movement180
-        }
-    };
-}
+        signal: signalResult.signal,
 
-// ============================================================
-// SIGNAL CONFLICT DETECTION
-// ============================================================
+        strength:
+            signalResult.strength || 'UNKNOWN',
 
-function calculateConflict(
-    components
-) {
-    const directionalComponents = [
-        components.momentum,
-        components.orderBook,
-        components.tradePressure,
-        components.trend
-    ];
+        entryPrice: round(price),
 
-    let bullish = 0;
-    let bearish = 0;
-    let active = 0;
+        settlementType:
+            marketSnapshot?.cryptoMarket?.strike !== null &&
+            marketSnapshot?.cryptoMarket?.strike !== undefined
+                ? 'CRYPTO_COM_STRIKE'
+                : 'PRICE_DIRECTION',
 
-    for (
-        const component
-        of directionalComponents
-    ) {
-        if (!component) {
-            continue;
-        }
+        strikePrice:
+            marketSnapshot?.cryptoMarket?.strike !== null &&
+            marketSnapshot?.cryptoMarket?.strike !== undefined
+                ? round(Number(marketSnapshot.cryptoMarket.strike), 8)
+                : null,
 
-        if (
-            component.score >
-            CONFIG.neutralZone
-        ) {
-            bullish++;
-            active++;
-        } else if (
-            component.score <
-            -CONFIG.neutralZone
-        ) {
-            bearish++;
-            active++;
-        }
-    }
+        strikeOperator:
+            marketSnapshot?.cryptoMarket?.strikeOperator || null,
 
-    if (active < 2) {
-        return {
-            conflict: 0,
-            bullish,
-            bearish,
-            active,
-            level: "LOW"
-        };
-    }
+        cryptoContractSymbol:
+            marketSnapshot?.cryptoMarket?.symbol || null,
 
-    const conflict =
-        Math.min(
-            bullish,
-            bearish
-        ) /
-        active;
+        cryptoMarketOpenTime:
+            marketSnapshot?.cryptoMarket?.openTime || null,
 
-    let level = "LOW";
+        cryptoMarketCloseTime:
+            marketSnapshot?.cryptoMarket?.closeTime || null,
 
-    if (conflict >= 0.40) {
-        level = "HIGH";
-    } else if (
-        conflict >= 0.25
-    ) {
-        level = "MEDIUM";
-    }
+        entryTime:
+            entryTime.toISOString(),
 
-    return {
-        conflict,
-        bullish,
-        bearish,
-        active,
-        level
-    };
-}
-
-// ============================================================
-// WEIGHTED MODEL SCORE
-// ============================================================
-
-function calculateWeightedScore(
-    components
-) {
-    const weights =
-        CONFIG.weights;
-
-    let score = 0;
-    let weight = 0;
-
-    const entries = [
-        [
-            components.momentum,
-            weights.momentum
-        ],
-        [
-            components.orderBook,
-            weights.orderBook
-        ],
-        [
-            components.tradePressure,
-            weights.tradePressure
-        ],
-        [
-            components.volatility,
-            weights.volatility
-        ],
-        [
-            components.microstructure,
-            weights.microstructure
-        ],
-        [
-            components.trend,
-            weights.trend
-        ]
-    ];
-
-    for (
-        const [component, componentWeight]
-        of entries
-    ) {
-        if (!component) {
-            continue;
-        }
-
-        score +=
-            safeNumber(
-                component.score
-            ) *
-            componentWeight;
-
-        weight +=
-            componentWeight;
-    }
-
-    if (weight <= 0) {
-        return 0;
-    }
-
-    return clamp(
-        score / weight,
-        -1,
-        1
-    );
-}
-
-// ============================================================
-// QUALITY
-// ============================================================
-
-function calculateFeatureQuality(
-    snapshot
-) {
-    const direct =
-        finiteOrNull(
-            snapshot?.featureQuality
-        );
-
-    if (direct !== null) {
-        return clamp(
-            direct,
-            0,
-            100
-        );
-    }
-
-    const featureContainer =
-        getFeatureContainer(
-            snapshot
-        );
-
-    const featureQuality =
-        finiteOrNull(
-            featureContainer.quality ??
-            featureContainer.featureQuality
-        );
-
-    if (
-        featureQuality !== null
-    ) {
-        return clamp(
-            featureQuality,
-            0,
-            100
-        );
-    }
-
-    const dataQuality =
-        finiteOrNull(
-            snapshot?.dataQuality
-        );
-
-    if (dataQuality !== null) {
-        return clamp(
-            dataQuality,
-            0,
-            100
-        );
-    }
-
-    return 50;
-}
-
-// ============================================================
-// PROBABILITY CONVERSION
-// ============================================================
-
-function scoreToProbability(
-    score
-) {
-    const strength =
-        3.0;
-
-    const positiveProbability =
-        1 /
-        (
-            1 +
-            Math.exp(
-                -score * strength
-            )
-        );
-
-    let upProbability =
-        positiveProbability *
-        100;
-
-    upProbability =
-        clamp(
-            upProbability,
-            CONFIG.minimumProbability,
-            CONFIG.maximumProbability
-        );
-
-    let downProbability =
-        100 -
-        upProbability;
-
-    downProbability =
-        clamp(
-            downProbability,
-            CONFIG.minimumProbability,
-            CONFIG.maximumProbability
-        );
-
-    const total =
-        upProbability +
-        downProbability;
-
-    upProbability =
-        (
-            upProbability /
-            total
-        ) *
-        100;
-
-    downProbability =
-        (
-            downProbability /
-            total
-        ) *
-        100;
-
-    return {
-        up: upProbability,
-        down: downProbability
-    };
-}
-
-// ============================================================
-// MAIN PROBABILITY ENGINE
-// ============================================================
-
-function calculateProbability(
-    snapshot
-) {
-    if (!snapshot) {
-        return {
-            timestamp: Date.now(),
-
-            signal: "SKIP",
-
-            reason:
-                "NO_MARKET_SNAPSHOT",
-
-            upProbability: 50,
-            downProbability: 50,
-
-            confidence: 0,
-
-            featureQuality: 0,
-
-            modelScore: 0
-        };
-    }
-
-    const featureQuality =
-        calculateFeatureQuality(
-            snapshot
-        );
-
-    const momentum =
-        calculateMomentumScore(
-            snapshot
-        );
-
-    const orderBook =
-        calculateOrderBookScore(
-            snapshot
-        );
-
-    const tradePressure =
-        calculateTradePressureScore(
-            snapshot
-        );
-
-    const volatility =
-        calculateVolatilityScore(
-            snapshot
-        );
-
-    const microstructure =
-        calculateMicrostructureScore(
-            snapshot
-        );
-
-    const trend =
-        calculateTrendScore(
-            snapshot
-        );
-
-    const components = {
-        momentum,
-        orderBook,
-        tradePressure,
-        volatility,
-        microstructure,
-        trend
-    };
-
-    let modelScore =
-        calculateWeightedScore(
-            components
-        );
-
-    const conflict =
-        calculateConflict(
-            components
-        );
-
-    if (
-        conflict.conflict > 0
-    ) {
-        const penalty =
-            conflict.conflict *
-            CONFIG.conflictPenalty;
-
-        modelScore *=
-            1 -
-            penalty;
-    }
-
-    if (
-        featureQuality <
-        CONFIG.minimumFeatureQuality
-    ) {
-        const qualityRatio =
-            featureQuality /
-            CONFIG.minimumFeatureQuality;
-
-        modelScore *=
-            qualityRatio;
-    }
-
-    modelScore =
-        clamp(
-            modelScore,
-            -1,
-            1
-        );
-
-    let probability =
-        scoreToProbability(
-            modelScore
-        );
-
-    // --------------------------------------------------------
-    // Evidence-based confidence
-    // --------------------------------------------------------
-
-    const directionalComponents = [
-        {
-            component: momentum,
-            weight: CONFIG.weights.momentum
-        },
-        {
-            component: orderBook,
-            weight: CONFIG.weights.orderBook
-        },
-        {
-            component: tradePressure,
-            weight: CONFIG.weights.tradePressure
-        },
-        {
-            component: trend,
-            weight: CONFIG.weights.trend
-        }
-    ];
-
-    const modelDirection =
-        modelScore > 0
-            ? 1
-            : modelScore < 0
-                ? -1
-                : 0;
-
-    let activeWeight = 0;
-    let strengthSum = 0;
-    let agreementWeight = 0;
-
-    for (const item of directionalComponents) {
-        const score =
-            safeNumber(
-                item.component?.score,
-                0
-            );
-
-        const absoluteScore =
-            Math.abs(score);
-
-        if (
-            absoluteScore <=
-            CONFIG.neutralZone
-        ) {
-            continue;
-        }
-
-        activeWeight +=
-            item.weight;
-
-        strengthSum +=
-            absoluteScore *
-            item.weight;
-
-        if (
-            modelDirection !== 0 &&
-            Math.sign(score) ===
-                modelDirection
-        ) {
-            agreementWeight +=
-                item.weight;
-        }
-    }
-
-    const directionalStrength =
-        activeWeight > 0
-            ? strengthSum /
-              activeWeight
-            : Math.abs(
-                modelScore
-            );
-
-    const agreement =
-        activeWeight > 0
-            ? agreementWeight /
-              activeWeight
-            : 0;
-
-    const volatilityModifier =
-        clamp(
-            safeNumber(
-                volatility.confidence,
-                50
-            ) / 100,
-            0.50,
-            1
-        );
-
-    const qualityModifier =
-        clamp(
-            featureQuality / 100,
-            0.50,
-            1
-        );
-
-    const agreementFactor =
-        0.65 +
-        agreement * 0.35;
-
-    const volatilityAdjustment =
-        0.85 +
-        volatilityModifier * 0.15;
-
-    const qualityAdjustment =
-        0.90 +
-        qualityModifier * 0.10;
-
-    let confidence =
-        (
-            50 +
-            directionalStrength * 50
-        ) *
-        agreementFactor *
-        volatilityAdjustment *
-        qualityAdjustment;
-
-    confidence =
-        clamp(
-            confidence,
-            0,
-            100
-        );
-
-    // --------------------------------------------------------
-    // Determine direction
-    // --------------------------------------------------------
-
-    let direction =
-        probability.up >
-        probability.down
-            ? "UP"
-            : "DOWN";
-
-    // --------------------------------------------------------
-    // Determine signal
-    // --------------------------------------------------------
-
-    let signal = "SKIP";
-    let reason = "";
-
-    if (
-        featureQuality <
-        CONFIG.minimumFeatureQuality
-    ) {
-        signal = "SKIP";
-
-        reason =
-            "FEATURE_QUALITY_TOO_LOW";
-    } else if (
-        confidence <
-        CONFIG.minimumConfidenceForSignal
-    ) {
-        signal = "SKIP";
-
-        reason =
-            "CONFIDENCE_TOO_LOW";
-    } else if (
-        conflict.level === "HIGH" &&
-        confidence <
-            CONFIG.strongConfidence
-    ) {
-        signal = "SKIP";
-
-        reason =
-            "SIGNAL_CONFLICT";
-    } else if (
-        direction === "UP"
-    ) {
-        signal = "UP";
-
-        reason =
-            "BULLISH_FEATURE_ALIGNMENT";
-    } else {
-        signal = "DOWN";
-
-        reason =
-            "BEARISH_FEATURE_ALIGNMENT";
-    }
-
-    // --------------------------------------------------------
-    // Confidence classification
-    // --------------------------------------------------------
-
-    let confidenceLevel =
-        "LOW";
-
-    if (
-        confidence >=
-        CONFIG.extremeConfidence
-    ) {
-        confidenceLevel =
-            "EXTREME";
-    } else if (
-        confidence >=
-        CONFIG.strongConfidence
-    ) {
-        confidenceLevel =
-            "STRONG";
-    } else if (
-        confidence >=
-        CONFIG.minimumConfidenceForSignal
-    ) {
-        confidenceLevel =
-            "MODERATE";
-    }
-
-    // --------------------------------------------------------
-    // Final result
-    // --------------------------------------------------------
-
-    return {
-        timestamp:
-            Date.now(),
-
-        signal,
-
-        direction,
-
-        reason,
+        expirationTime:
+            expirationTime.toISOString(),
 
         upProbability:
-            round(
-                probability.up,
-                2
+            safeNumber(
+                signalResult.upProbability,
+                50
             ),
 
         downProbability:
-            round(
-                probability.down,
-                2
+            safeNumber(
+                signalResult.downProbability,
+                50
             ),
 
         confidence:
-            round(
-                confidence,
-                2
-            ),
-
-        confidenceLevel,
-
-        modelScore:
-            round(
-                modelScore,
-                4
+            safeNumber(
+                signalResult.confidence,
+                0
             ),
 
         featureQuality:
-            round(
-                featureQuality,
-                2
+            safeNumber(
+                signalResult.featureQuality,
+                0
             ),
 
-        conflict: {
-            level:
-                conflict.level,
+        dataQuality:
+            safeNumber(
+                signalResult.dataQuality,
+                0
+            ),
 
-            score:
-                round(
-                    conflict.conflict,
-                    4
-                ),
+        probabilityEdge:
+            safeNumber(
+                signalResult.probabilityEdge,
+                0
+            ),
 
-            bullishComponents:
-                conflict.bullish,
+        conflict:
+            safeNumber(
+                signalResult.conflict,
+                0
+            ),
 
-            bearishComponents:
-                conflict.bearish,
+        reason:
+            signalResult.reason ||
+            'ALL_FILTERS_PASSED',
 
-            activeComponents:
-                conflict.active
-        },
+        exitPrice: null,
 
-        components: {
-            momentum: {
-                score:
-                    round(
-                        momentum.score,
-                        4
-                    ),
+        exitTime: null,
 
-                confidence:
-                    round(
-                        momentum.confidence,
-                        2
-                    ),
+        result: null,
 
-                direction:
-                    momentum.direction,
+        priceChange: null,
 
-                details:
-                    momentum.components
-            },
+        priceChangePercent: null,
 
-            orderBook: {
-                score:
-                    round(
-                        orderBook.score,
-                        4
-                    ),
+        durationMs: null
+    };
 
-                confidence:
-                    round(
-                        orderBook.confidence,
-                        2
-                    ),
 
-                direction:
-                    orderBook.direction,
+    /*
+    Store prediction
+    */
 
-                details:
-                    orderBook.components
-            },
+    state.predictions.push(prediction);
 
-            tradePressure: {
-                score:
-                    round(
-                        tradePressure.score,
-                        4
-                    ),
+    state.activePrediction =
+        prediction;
 
-                confidence:
-                    round(
-                        tradePressure.confidence,
-                        2
-                    ),
 
-                direction:
-                    tradePressure.direction,
-
-                details:
-                    tradePressure.components
-            },
-
-            volatility: {
-                score:
-                    round(
-                        volatility.score,
-                        4
-                    ),
-
-                confidence:
-                    round(
-                        volatility.confidence,
-                        2
-                    ),
-
-                regime:
-                    volatility.regime,
-
-                details:
-                    volatility.components
-            },
-
-            microstructure: {
-                score:
-                    round(
-                        microstructure.score,
-                        4
-                    ),
-
-                confidence:
-                    round(
-                        microstructure.confidence,
-                        2
-                    ),
-
-                details:
-                    microstructure.components
-            },
-
-            trend: {
-                score:
-                    round(
-                        trend.score,
-                        4
-                    ),
-
-                confidence:
-                    round(
-                        trend.confidence,
-                        2
-                    ),
-
-                direction:
-                    trend.direction,
-
-                details:
-                    trend.components
-            }
-        }
+    return {
+        created: true,
+        prediction
     };
 }
 
+
 // ============================================================
-// HUMAN-READABLE REPORT
+// RESOLVE PREDICTION
 // ============================================================
 
-function printProbabilityReport(
-    result
+function resolvePrediction(predictionId, finalPrice, resolutionTime = new Date()) {
+    const prediction =
+        state.predictions.find(
+            item => item.id === predictionId
+        );
+
+
+    if (!prediction) {
+        return {
+            resolved: false,
+            reason: 'PREDICTION_NOT_FOUND'
+        };
+    }
+
+
+    if (prediction.status !== 'ACTIVE') {
+        return {
+            resolved: false,
+            reason: 'PREDICTION_ALREADY_RESOLVED',
+            prediction
+        };
+    }
+
+
+    const exitPrice =
+        safeNumber(
+            finalPrice,
+            NaN
+        );
+
+
+    if (
+        !Number.isFinite(exitPrice) ||
+        exitPrice <= CONFIG.minimumPrice
+    ) {
+        return {
+            resolved: false,
+            reason: 'INVALID_EXIT_PRICE'
+        };
+    }
+
+
+    const exitDate =
+        resolutionTime instanceof Date
+            ? resolutionTime
+            : new Date(resolutionTime);
+
+
+    /*
+    Calculate price movement
+    */
+
+    const priceChange =
+        exitPrice -
+        prediction.entryPrice;
+
+
+    const priceChangePercent =
+        prediction.entryPrice !== 0
+            ? (
+                priceChange /
+                prediction.entryPrice
+            ) * 100
+            : 0;
+
+
+    /*
+    Determine result
+
+    UP wins when final price > entry price.
+
+    DOWN wins when final price < entry price.
+
+    Exact same price = PUSH.
+    */
+
+    let result;
+
+    if (
+        prediction.settlementType === 'CRYPTO_COM_STRIKE' &&
+        Number.isFinite(prediction.strikePrice)
+    ) {
+        const operator = prediction.strikeOperator || '>';
+        let yesOutcome;
+
+        if (operator === '>=') {
+            yesOutcome = exitPrice >= prediction.strikePrice;
+        } else if (operator === '=') {
+            yesOutcome = exitPrice === prediction.strikePrice;
+        } else if (operator === '<=') {
+            yesOutcome = exitPrice <= prediction.strikePrice;
+        } else if (operator === '<') {
+            yesOutcome = exitPrice < prediction.strikePrice;
+        } else {
+            yesOutcome = exitPrice > prediction.strikePrice;
+        }
+
+        const predictedYes = prediction.direction === 'UP';
+        result = yesOutcome === predictedYes ? 'WIN' : 'LOSS';
+    } else if (exitPrice > prediction.entryPrice) {
+        result =
+            prediction.direction === 'UP'
+                ? 'WIN'
+                : 'LOSS';
+    } else if (exitPrice < prediction.entryPrice) {
+        result =
+            prediction.direction === 'DOWN'
+                ? 'WIN'
+                : 'LOSS';
+    } else {
+        result = 'PUSH';
+    }
+
+
+    /*
+    Update prediction
+    */
+
+    prediction.status =
+        'RESOLVED';
+
+    prediction.exitPrice =
+        round(exitPrice);
+
+    prediction.exitTime =
+        exitDate.toISOString();
+
+    prediction.result =
+        result;
+
+    prediction.priceChange =
+        round(priceChange);
+
+    prediction.priceChangePercent =
+        round(
+            priceChangePercent,
+            6
+        );
+
+    prediction.durationMs =
+        Math.max(
+            0,
+            exitDate.getTime() -
+            new Date(
+                prediction.entryTime
+            ).getTime()
+        );
+
+
+    /*
+    Clear active prediction
+    */
+
+    if (
+        state.activePrediction &&
+        state.activePrediction.id ===
+        prediction.id
+    ) {
+        state.activePrediction = null;
+    }
+
+
+    return {
+        resolved: true,
+        prediction
+    };
+}
+
+
+// ============================================================
+// CHECK FOR EXPIRED PREDICTION
+// ============================================================
+
+function isPredictionExpired(
+    prediction,
+    now = new Date()
 ) {
+    if (!prediction) {
+        return false;
+    }
+
+    const expiration =
+        new Date(
+            prediction.expirationTime
+        );
+
+    const currentTime =
+        now instanceof Date
+            ? now
+            : new Date(now);
+
+    return (
+        currentTime.getTime() >=
+        expiration.getTime()
+    );
+}
+
+
+// ============================================================
+// GET ACTIVE PREDICTION
+// ============================================================
+
+function getActivePrediction() {
+    return state.activePrediction;
+}
+
+
+// ============================================================
+// GET PREDICTION BY ID
+// ============================================================
+
+function getPrediction(predictionId) {
+    return (
+        state.predictions.find(
+            item =>
+                item.id === predictionId
+        ) || null
+    );
+}
+
+
+// ============================================================
+// GET ALL PREDICTIONS
+// ============================================================
+
+function getPredictions() {
+    return [
+        ...state.predictions
+    ];
+}
+
+
+// ============================================================
+// GET PREDICTION HISTORY
+// ============================================================
+
+function getPredictionHistory() {
+    return state.predictions.filter(
+        prediction =>
+            prediction.status ===
+            'RESOLVED'
+    );
+}
+
+
+// ============================================================
+// GET PREDICTION SUMMARY
+// ============================================================
+
+function getPredictionSummary() {
+    const predictions =
+        state.predictions;
+
+
+    const resolved =
+        predictions.filter(
+            prediction =>
+                prediction.status ===
+                'RESOLVED'
+        );
+
+
+    const wins =
+        resolved.filter(
+            prediction =>
+                prediction.result ===
+                'WIN'
+        ).length;
+
+
+    const losses =
+        resolved.filter(
+            prediction =>
+                prediction.result ===
+                'LOSS'
+        ).length;
+
+
+    const pushes =
+        resolved.filter(
+            prediction =>
+                prediction.result ===
+                'PUSH'
+        ).length;
+
+
+    const active =
+        predictions.filter(
+            prediction =>
+                prediction.status ===
+                'ACTIVE'
+        ).length;
+
+
+    const totalResolved =
+        wins +
+        losses;
+
+
+    const winRate =
+        totalResolved > 0
+            ? (
+                wins /
+                totalResolved
+            ) * 100
+            : 0;
+
+
+    return {
+        totalPredictions:
+            predictions.length,
+
+        active,
+
+        resolved:
+            resolved.length,
+
+        wins,
+
+        losses,
+
+        pushes,
+
+        winRate:
+            round(winRate, 2)
+    };
+}
+
+
+// ============================================================
+// PRINT PREDICTION REPORT
+// ============================================================
+
+function printPredictionReport(result) {
+    console.log('');
+    console.log('==============================================');
+    console.log('          ZEUS PREDICTION ENGINE');
+    console.log('==============================================');
+
+
     if (!result) {
+        console.log('No result.');
+        console.log('==============================================');
         return;
     }
 
-    console.log("");
+
+    if (!result.created) {
+        console.log(
+            `Created: NO`
+        );
+
+        console.log(
+            `Reason: ${result.reason}`
+        );
+
+
+        if (result.activePredictionId) {
+            console.log(
+                `Active Prediction: ${
+                    result.activePredictionId
+                }`
+            );
+        }
+
+        console.log('----------------------------------------------');
+        console.log('No prediction created.');
+        console.log('==============================================');
+
+        return;
+    }
+
+
+    const prediction =
+        result.prediction;
+
 
     console.log(
-        "========== ZEUS PROBABILITY ENGINE =========="
+        `Created: YES`
     );
 
     console.log(
-        `Signal: ${result.signal}`
+        `ID: ${prediction.id}`
     );
 
     console.log(
-        `Direction: ${result.direction || "NEUTRAL"}`
+        `Status: ${prediction.status}`
     );
 
     console.log(
-        `UP Probability: ${result.upProbability}%`
+        `Direction: ${prediction.direction}`
     );
 
     console.log(
-        `DOWN Probability: ${result.downProbability}%`
+        `Strength: ${prediction.strength}`
     );
 
     console.log(
-        `Confidence: ${result.confidence}% (${result.confidenceLevel})`
+        `Entry Price: $${prediction.entryPrice}`
     );
 
     console.log(
-        `Feature Quality: ${result.featureQuality}%`
+        `Entry Time: ${prediction.entryTime}`
     );
 
     console.log(
-        `Model Score: ${result.modelScore}`
+        `Expiration: ${prediction.expirationTime}`
     );
 
     console.log(
-        `Conflict: ${result.conflict.level}`
+        `UP Probability: ${
+            round(
+                prediction.upProbability,
+                2
+            )
+        }%`
     );
 
     console.log(
-        `Reason: ${result.reason}`
+        `DOWN Probability: ${
+            round(
+                prediction.downProbability,
+                2
+            )
+        }%`
     );
 
     console.log(
-        "----------------------------------------------"
+        `Confidence: ${
+            round(
+                prediction.confidence,
+                2
+            )
+        }%`
     );
 
     console.log(
-        `Momentum: ${
-            result.components.momentum.direction
-        } (${result.components.momentum.score})`
+        `Feature Quality: ${
+            round(
+                prediction.featureQuality,
+                2
+            )
+        }%`
     );
 
     console.log(
-        `Order Book: ${
-            result.components.orderBook.direction
-        } (${result.components.orderBook.score})`
+        `Data Quality: ${
+            round(
+                prediction.dataQuality,
+                2
+            )
+        }%`
     );
 
     console.log(
-        `Trade Pressure: ${
-            result.components.tradePressure.direction
-        } (${result.components.tradePressure.score})`
+        `Probability Edge: ${
+            round(
+                prediction.probabilityEdge,
+                2
+            )
+        }%`
     );
 
     console.log(
-        `Volatility: ${
-            result.components.volatility.regime
+        `Conflict: ${
+            round(
+                prediction.conflict,
+                4
+            )
         }`
     );
 
     console.log(
-        `Trend: ${
-            result.components.trend.direction
-        } (${result.components.trend.score})`
+        `Reason: ${prediction.reason}`
     );
 
-    console.log(
-        "=============================================="
-    );
+    console.log('----------------------------------------------');
+    console.log('PAPER PREDICTION ONLY');
+    console.log('No real trade was placed.');
+    console.log('==============================================');
 }
 
+
 // ============================================================
-// TEST HELPERS
+// TESTS
 // ============================================================
 
-function createTestSnapshot(overrides = {}) {
-    return {
-        dataQuality: 90,
+function runTests() {
+    console.log('==============================================');
+    console.log('       ZEUS PREDICTION ENGINE TEST');
+    console.log('==============================================');
 
-        featureQuality: 90,
 
-        movements: {
-            15: 0,
-            30: 0,
-            60: 0,
-            180: 0,
-            300: 0
-        },
+    /*
+    --------------------------------------------------------
+    TEST 1
+    SKIP signal
+    Expected: no prediction
+    --------------------------------------------------------
+    */
 
-        orderBook: {
-            combined: {
-                imbalance: 0
-            }
-        },
+    console.log('');
+    console.log('TEST 1: SKIP signal');
 
-        trades: {
-            recent15s: {
-                imbalance: 0
+    const test1 =
+        createPrediction(
+            {
+                signal: 'SKIP',
+                direction: 'UP',
+
+                upProbability: 72,
+                downProbability: 28,
+
+                confidence: 34,
+
+                featureQuality: 85,
+                dataQuality: 90,
+
+                probabilityEdge: 22,
+
+                conflict: 0.10,
+
+                strength: 'WEAK'
             },
-
-            recent30s: {
-                imbalance: 0
-            },
-
-            recent60s: {
-                imbalance: 0
+            {
+                price: 77000
             }
-        },
+        );
 
-        volatility: {
-            realized15s: 0.000025,
-            realized30s: 0.000030,
-            realized60s: 0.000035
-        },
+    printPredictionReport(test1);
 
-        features: {
-            imbalance5: 0,
-            imbalance10: 0,
-            imbalance25: 0,
 
-            shortTermAcceleration: 0,
+    /*
+    --------------------------------------------------------
+    TEST 2
+    Strong UP signal
+    Expected: prediction created
+    --------------------------------------------------------
+    */
 
-            averageSpreadPercent:
-                0.00008,
+    console.log('');
+    console.log('TEST 2: Strong UP signal');
 
-            crossExchangeDifferencePercent:
-                0.0015
-        },
+    const test2 =
+        createPrediction(
+            {
+                signal: 'UP',
+                direction: 'UP',
 
-        ...overrides
-    };
+                upProbability: 81,
+                downProbability: 19,
+
+                confidence: 76,
+
+                featureQuality: 90,
+                dataQuality: 90,
+
+                probabilityEdge: 31,
+
+                conflict: 0.12,
+
+                strength: 'STRONG',
+
+                reason: 'ALL_FILTERS_PASSED'
+            },
+            {
+                price: 77000
+            }
+        );
+
+    printPredictionReport(test2);
+
+
+    /*
+    --------------------------------------------------------
+    TEST 3
+    Attempt second prediction while first is active
+    Expected: rejected
+    --------------------------------------------------------
+    */
+
+    console.log('');
+    console.log('TEST 3: Duplicate active prediction');
+
+    const test3 =
+        createPrediction(
+            {
+                signal: 'DOWN',
+                direction: 'DOWN',
+
+                upProbability: 20,
+                downProbability: 80,
+
+                confidence: 78,
+
+                featureQuality: 91,
+                dataQuality: 92,
+
+                probabilityEdge: 30,
+
+                conflict: 0.10,
+
+                strength: 'STRONG',
+
+                reason: 'ALL_FILTERS_PASSED'
+            },
+            {
+                price: 77050
+            }
+        );
+
+    printPredictionReport(test3);
+
+
+    /*
+    --------------------------------------------------------
+    TEST 4
+    Resolve first prediction as WIN
+    --------------------------------------------------------
+    */
+
+    console.log('');
+    console.log('TEST 4: Resolve UP prediction as WIN');
+
+    const active =
+        getActivePrediction();
+
+    if (active) {
+        const test4 =
+            resolvePrediction(
+                active.id,
+                77100
+            );
+
+        console.log(
+            `Resolved: ${
+                test4.resolved
+                    ? 'YES'
+                    : 'NO'
+            }`
+        );
+
+        if (test4.prediction) {
+            console.log(
+                `ID: ${
+                    test4.prediction.id
+                }`
+            );
+
+            console.log(
+                `Direction: ${
+                    test4.prediction.direction
+                }`
+            );
+
+            console.log(
+                `Entry Price: $${
+                    test4.prediction.entryPrice
+                }`
+            );
+
+            console.log(
+                `Exit Price: $${
+                    test4.prediction.exitPrice
+                }`
+            );
+
+            console.log(
+                `Result: ${
+                    test4.prediction.result
+                }`
+            );
+
+            console.log(
+                `Price Change: ${
+                    test4.prediction.priceChangePercent
+                }%`
+            );
+        }
+    }
+
+
+    /*
+    --------------------------------------------------------
+    TEST 5
+    Create DOWN prediction after previous one resolved
+    Expected: prediction created
+    --------------------------------------------------------
+    */
+
+    console.log('');
+    console.log('TEST 5: Strong DOWN signal');
+
+    const test5 =
+        createPrediction(
+            {
+                signal: 'DOWN',
+                direction: 'DOWN',
+
+                upProbability: 18,
+                downProbability: 82,
+
+                confidence: 83,
+
+                featureQuality: 94,
+                dataQuality: 95,
+
+                probabilityEdge: 32,
+
+                conflict: 0.08,
+
+                strength: 'EXTREME',
+
+                reason: 'ALL_FILTERS_PASSED'
+            },
+            {
+                price: 77100
+            }
+        );
+
+    printPredictionReport(test5);
+
+
+    /*
+    --------------------------------------------------------
+    FINAL SUMMARY
+    --------------------------------------------------------
+    */
+
+    console.log('');
+    console.log('==============================================');
+    console.log('        PREDICTION ENGINE SUMMARY');
+    console.log('==============================================');
+
+    console.log(
+        getPredictionSummary()
+    );
+
+    console.log('');
+
+    console.log(
+        'Prediction engine test complete.'
+    );
+
+    console.log(
+        'No real trades were placed.'
+    );
+
+    console.log('==============================================');
 }
 
-// ============================================================
-// DIRECT TESTS
-// ============================================================
-// These tests do NOT connect to an exchange.
-// They do NOT trade.
-//
-// IMPORTANT:
-// Every test creates its OWN snapshot.
-// This prevents one test from accidentally reusing
-// another test's market data.
-// ============================================================
-
-if (
-    require.main === module
-) {
-    console.log(
-        "=============================================="
-    );
-
-    console.log(
-        "     ZEUS PROBABILITY ENGINE TESTS"
-    );
-
-    console.log(
-        "=============================================="
-    );
-
-    // ========================================================
-    // TEST 1
-    // Strong bullish market
-    // ========================================================
-
-    console.log("");
-    console.log(
-        "TEST 1: STRONG BULLISH MARKET"
-    );
-
-    const bullishSnapshot =
-        createTestSnapshot({
-            movements: {
-                15: 0.0200,
-                30: 0.0350,
-                60: 0.0500,
-                180: 0.0300,
-                300: 0.0150
-            },
-
-            orderBook: {
-                combined: {
-                    imbalance: 0.35
-                }
-            },
-
-            trades: {
-                recent15s: {
-                    imbalance: 0.55
-                },
-
-                recent30s: {
-                    imbalance: 0.62
-                },
-
-                recent60s: {
-                    imbalance: 0.70
-                }
-            },
-
-            features: {
-                imbalance5: 0.45,
-                imbalance10: 0.38,
-                imbalance25: 0.20,
-
-                shortTermAcceleration:
-                    0.0150,
-
-                averageSpreadPercent:
-                    0.00008,
-
-                crossExchangeDifferencePercent:
-                    0.0015
-            }
-        });
-
-    const bullishResult =
-        calculateProbability(
-            bullishSnapshot
-        );
-
-    printProbabilityReport(
-        bullishResult
-    );
-
-    // ========================================================
-    // TEST 2
-    // Completely flat market
-    // ========================================================
-
-    console.log("");
-    console.log(
-        "TEST 2: FLAT MARKET"
-    );
-
-    const flatSnapshot =
-        createTestSnapshot({
-            movements: {
-                15: 0,
-                30: 0,
-                60: 0,
-                180: 0,
-                300: 0
-            },
-
-            orderBook: {
-                combined: {
-                    imbalance: 0
-                }
-            },
-
-            trades: {
-                recent15s: {
-                    imbalance: 0
-                },
-
-                recent30s: {
-                    imbalance: 0
-                },
-
-                recent60s: {
-                    imbalance: 0
-                }
-            },
-
-            features: {
-                imbalance5: 0,
-                imbalance10: 0,
-                imbalance25: 0,
-
-                shortTermAcceleration:
-                    0,
-
-                averageSpreadPercent:
-                    0.00008,
-
-                crossExchangeDifferencePercent:
-                    0.0015
-            }
-        });
-
-    const flatResult =
-        calculateProbability(
-            flatSnapshot
-        );
-
-    printProbabilityReport(
-        flatResult
-    );
-
-    // ========================================================
-    // TEST 3
-    // Strong bearish market
-    // ========================================================
-
-    console.log("");
-    console.log(
-        "TEST 3: STRONG BEARISH MARKET"
-    );
-
-    const bearishSnapshot =
-        createTestSnapshot({
-            movements: {
-                15: -0.0200,
-                30: -0.0350,
-                60: -0.0500,
-                180: -0.0300,
-                300: -0.0150
-            },
-
-            orderBook: {
-                combined: {
-                    imbalance: -0.35
-                }
-            },
-
-            trades: {
-                recent15s: {
-                    imbalance: -0.55
-                },
-
-                recent30s: {
-                    imbalance: -0.62
-                },
-
-                recent60s: {
-                    imbalance: -0.70
-                }
-            },
-
-            features: {
-                imbalance5: -0.45,
-                imbalance10: -0.38,
-                imbalance25: -0.20,
-
-                shortTermAcceleration:
-                    -0.0150,
-
-                averageSpreadPercent:
-                    0.00008,
-
-                crossExchangeDifferencePercent:
-                    0.0015
-            }
-        });
-
-    const bearishResult =
-        calculateProbability(
-            bearishSnapshot
-        );
-
-    printProbabilityReport(
-        bearishResult
-    );
-
-    // ========================================================
-    // TEST 4
-    // Realistic mixed market
-    // ========================================================
-
-    console.log("");
-    console.log(
-        "TEST 4: REALISTIC MIXED MARKET"
-    );
-
-    const mixedSnapshot =
-        createTestSnapshot({
-            movements: {
-                15: 0.0020,
-                30: 0.0080,
-                60: 0.0120,
-                180: 0.0200,
-                300: 0.0100
-            },
-
-            orderBook: {
-                combined: {
-                    imbalance: -0.10
-                }
-            },
-
-            trades: {
-                recent15s: {
-                    imbalance: -0.08
-                },
-
-                recent30s: {
-                    imbalance: -0.12
-                },
-
-                recent60s: {
-                    imbalance: -0.15
-                }
-            },
-
-            features: {
-                imbalance5: -0.12,
-                imbalance10: -0.08,
-                imbalance25: -0.04,
-
-                shortTermAcceleration:
-                    0.0020,
-
-                averageSpreadPercent:
-                    0.000566,
-
-                crossExchangeDifferencePercent:
-                    -0.001184
-            }
-        });
-
-    const mixedResult =
-        calculateProbability(
-            mixedSnapshot
-        );
-
-    printProbabilityReport(
-        mixedResult
-    );
-
-    // ========================================================
-    // TEST 5
-    // Poor feature quality
-    // ========================================================
-
-    console.log("");
-    console.log(
-        "TEST 5: POOR FEATURE QUALITY"
-    );
-
-    const poorQualitySnapshot =
-        createTestSnapshot({
-            featureQuality: 35,
-
-            dataQuality: 35,
-
-            movements: {
-                15: 0.0400,
-                30: 0.0500,
-                60: 0.0600,
-                180: 0.0400,
-                300: 0.0300
-            },
-
-            orderBook: {
-                combined: {
-                    imbalance: 0.50
-                }
-            },
-
-            trades: {
-                recent15s: {
-                    imbalance: 0.70
-                },
-
-                recent30s: {
-                    imbalance: 0.75
-                },
-
-                recent60s: {
-                    imbalance: 0.80
-                }
-            },
-
-            features: {
-                imbalance5: 0.60,
-                imbalance10: 0.55,
-                imbalance25: 0.40,
-
-                shortTermAcceleration:
-                    0.0200,
-
-                averageSpreadPercent:
-                    0.00008,
-
-                crossExchangeDifferencePercent:
-                    0.0015
-            }
-        });
-
-    const poorQualityResult =
-        calculateProbability(
-            poorQualitySnapshot
-        );
-
-    printProbabilityReport(
-        poorQualityResult
-    );
-
-    // ========================================================
-    // TEST 6
-    // High conflict
-    // ========================================================
-
-    console.log("");
-    console.log(
-        "TEST 6: HIGH-CONFLICT MARKET"
-    );
-
-    const conflictSnapshot =
-        createTestSnapshot({
-            movements: {
-                15: 0.0600,
-                30: 0.0600,
-                60: 0.0500,
-                180: 0.0400,
-                300: 0.0300
-            },
-
-            orderBook: {
-                combined: {
-                    imbalance: -0.60
-                }
-            },
-
-            trades: {
-                recent15s: {
-                    imbalance: -0.70
-                },
-
-                recent30s: {
-                    imbalance: -0.65
-                },
-
-                recent60s: {
-                    imbalance: -0.60
-                }
-            },
-
-            features: {
-                imbalance5: -0.55,
-                imbalance10: -0.50,
-                imbalance25: -0.40,
-
-                shortTermAcceleration:
-                    0.0250,
-
-                averageSpreadPercent:
-                    0.00008,
-
-                crossExchangeDifferencePercent:
-                    0.0015
-            }
-        });
-
-    const conflictResult =
-        calculateProbability(
-            conflictSnapshot
-        );
-
-    printProbabilityReport(
-        conflictResult
-    );
-
-    // ========================================================
-    // TEST 7
-    // Missing features
-    // ========================================================
-
-    console.log("");
-    console.log(
-        "TEST 7: MISSING FEATURES"
-    );
-
-    const missingSnapshot = {
-        dataQuality: 90,
-        featureQuality: 90
-    };
-
-    const missingResult =
-        calculateProbability(
-            missingSnapshot
-        );
-
-    printProbabilityReport(
-        missingResult
-    );
-
-    // ========================================================
-    // TEST SUMMARY
-    // ========================================================
-
-    console.log("");
-    console.log(
-        "=============================================="
-    );
-
-    console.log(
-        "          ZEUS TEST SUMMARY"
-    );
-
-    console.log(
-        "=============================================="
-    );
-
-    console.log(
-        `TEST 1 bullish signal: ${bullishResult.signal}`
-    );
-
-    console.log(
-        `TEST 2 flat signal: ${flatResult.signal}`
-    );
-
-    console.log(
-        `TEST 3 bearish signal: ${bearishResult.signal}`
-    );
-
-    console.log(
-        `TEST 4 mixed signal: ${mixedResult.signal}`
-    );
-
-    console.log(
-        `TEST 5 poor-quality signal: ${poorQualityResult.signal}`
-    );
-
-    console.log(
-        `TEST 6 conflict signal: ${conflictResult.signal}`
-    );
-
-    console.log(
-        `TEST 7 missing-data signal: ${missingResult.signal}`
-    );
-
-    console.log(
-        "=============================================="
-    );
-
-    console.log("");
-    console.log(
-        "Probability engine tests complete."
-    );
-
-    console.log(
-        "No exchange connection was made."
-    );
-
-    console.log(
-        "No trades were placed."
-    );
-
-    console.log(
-        "=============================================="
-    );
-}
 
 // ============================================================
 // EXPORTS
 // ============================================================
 
 module.exports = {
-    calculateProbability,
-    printProbabilityReport,
+    CONFIG,
 
-    calculateMomentumScore,
-    calculateOrderBookScore,
-    calculateTradePressureScore,
-    calculateVolatilityScore,
-    calculateMicrostructureScore,
-    calculateTrendScore,
-    calculateConflict,
+    createPrediction,
 
-    CONFIG
+    resolvePrediction,
+
+    isPredictionExpired,
+
+    getActivePrediction,
+
+    getPrediction,
+
+    getPredictions,
+
+    getPredictionHistory,
+
+    getPredictionSummary,
+
+    printPredictionReport,
+
+    state
 };
+
+
+// ============================================================
+// STANDALONE TEST
+// ============================================================
+
+if (require.main === module) {
+    runTests();
+}
