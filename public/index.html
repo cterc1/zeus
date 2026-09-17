@@ -1,0 +1,3786 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+    <title>Zeus | Crypto Prediction Engine</title>
+
+    <style>
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            margin: 0;
+            min-height: 100vh;
+            background:
+                radial-gradient(circle at top, #172033 0%, #090d15 45%, #05070b 100%);
+            color: #ffffff;
+            font-family: Arial, Helvetica, sans-serif;
+        }
+
+        .container {
+            width: min(1400px, 94%);
+            margin: 0 auto;
+            padding: 30px 0 50px;
+        }
+
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 20px;
+            margin-bottom: 22px;
+        }
+
+        .brand {
+            display: flex;
+            align-items: center;
+            gap: 15px;
+        }
+
+        .logo {
+            width: 58px;
+            height: 58px;
+            border-radius: 16px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 30px;
+            background: linear-gradient(145deg, #252f44, #111722);
+            border: 1px solid #354158;
+            box-shadow: 0 0 30px rgba(255, 255, 255, 0.05);
+        }
+
+        .brand h1 {
+            margin: 0;
+            font-size: 30px;
+            letter-spacing: 2px;
+        }
+
+        .brand p {
+            margin: 4px 0 0;
+            color: #8f9bad;
+            font-size: 13px;
+        }
+
+        .status {
+            display: flex;
+            align-items: center;
+            gap: 9px;
+            padding: 10px 15px;
+            border-radius: 999px;
+            background: rgba(35, 45, 61, 0.75);
+            border: 1px solid #344157;
+            font-size: 13px;
+            font-weight: bold;
+        }
+
+        .status-dot {
+            width: 9px;
+            height: 9px;
+            border-radius: 50%;
+            background: #35d07f;
+            box-shadow: 0 0 12px rgba(53, 208, 127, 0.8);
+        }
+
+        .status-dot.offline {
+            background: #ff5d6c;
+            box-shadow: 0 0 12px rgba(255, 93, 108, 0.7);
+        }
+
+        .status-dot.waiting {
+            background: #f0b84b;
+            box-shadow: 0 0 12px rgba(240, 184, 75, 0.7);
+        }
+
+        .price-bar {
+            display: grid;
+            grid-template-columns: 1.4fr repeat(4, 1fr);
+            gap: 12px;
+            margin-bottom: 18px;
+        }
+
+        .price-card {
+            background: rgba(15, 20, 30, 0.88);
+            border: 1px solid #273143;
+            border-radius: 16px;
+            padding: 18px 20px;
+        }
+
+        .price-label {
+            color: #8995a8;
+            font-size: 11px;
+            font-weight: bold;
+            letter-spacing: 1.4px;
+            text-transform: uppercase;
+        }
+
+        .btc-price {
+            margin-top: 7px;
+            font-size: 30px;
+            font-weight: 800;
+        }
+
+        .metric-value {
+            margin-top: 8px;
+            font-size: 21px;
+            font-weight: 800;
+        }
+
+        .green {
+            color: #35d07f;
+        }
+
+        .red {
+            color: #ff5d6c;
+        }
+
+        .yellow {
+            color: #f0b84b;
+        }
+
+        .muted {
+            color: #8f9bad;
+        }
+
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 18px;
+        }
+
+        .card {
+            background: rgba(15, 20, 30, 0.88);
+            border: 1px solid #273143;
+            border-radius: 18px;
+            padding: 22px;
+            box-shadow: 0 15px 45px rgba(0, 0, 0, 0.25);
+        }
+
+        .record-card {
+            text-align: center;
+        }
+
+        .record-label {
+            color: #8995a8;
+            font-size: 12px;
+            font-weight: bold;
+            letter-spacing: 1.5px;
+            text-transform: uppercase;
+        }
+
+        .record-number {
+            margin-top: 10px;
+            font-size: 40px;
+            font-weight: 800;
+        }
+
+        .win {
+            color: #35d07f;
+        }
+
+        .loss {
+            color: #ff5d6c;
+        }
+
+        .skip {
+            color: #c2cad6;
+        }
+
+        .section-title {
+            margin: 0 0 17px;
+            font-size: 15px;
+            letter-spacing: 1px;
+        }
+
+        .main-card {
+            grid-column: span 2;
+            min-height: 350px;
+        }
+
+        .prediction-box {
+            min-height: 255px;
+            border: 1px dashed #354158;
+            border-radius: 14px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            text-align: center;
+            background: rgba(9, 13, 20, 0.65);
+            padding: 25px;
+        }
+
+        .prediction-symbol {
+            font-size: 45px;
+            margin-bottom: 8px;
+        }
+
+        .prediction-status {
+            font-size: 27px;
+            font-weight: 900;
+            letter-spacing: 1px;
+        }
+
+        .prediction-description {
+            margin-top: 9px;
+            color: #8792a4;
+            font-size: 13px;
+            max-width: 650px;
+        }
+
+        .probabilities {
+            width: min(600px, 100%);
+            margin-top: 20px;
+        }
+
+        .probability-row {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 6px;
+            font-size: 12px;
+            font-weight: bold;
+        }
+
+        .probability-track {
+            height: 9px;
+            border-radius: 999px;
+            background: #202938;
+            overflow: hidden;
+            margin-bottom: 11px;
+        }
+
+        .probability-fill {
+            height: 100%;
+            width: 0%;
+            border-radius: 999px;
+            transition: width 0.4s ease;
+        }
+
+        .up-fill {
+            background: #35d07f;
+        }
+
+        .down-fill {
+            background: #ff5d6c;
+        }
+
+        .prediction-meta {
+            display: flex;
+            flex-wrap: wrap;
+            justify-content: center;
+            gap: 10px;
+            margin-top: 14px;
+        }
+
+        .badge {
+            padding: 7px 11px;
+            border-radius: 999px;
+            border: 1px solid #344157;
+            background: rgba(35, 45, 61, 0.55);
+            color: #c7cfdb;
+            font-size: 11px;
+            font-weight: bold;
+        }
+
+        .countdown {
+            margin-top: 13px;
+            font-size: 25px;
+            font-weight: 900;
+        }
+
+        .round-panel {
+            width: min(650px, 100%);
+            margin-top: 18px;
+            padding: 13px 15px;
+            border: 1px solid #283449;
+            border-radius: 12px;
+            background: rgba(15, 21, 31, 0.8);
+            text-align: left;
+        }
+
+        .round-top {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .round-label {
+            color: #788599;
+            font-size: 10px;
+            font-weight: 800;
+            letter-spacing: 1px;
+            text-transform: uppercase;
+        }
+
+        .round-status {
+            font-size: 11px;
+            font-weight: 900;
+            letter-spacing: .5px;
+        }
+
+        .round-status.observing {
+            color: #f0b84b;
+        }
+
+        .round-status.complete {
+            color: #35d07f;
+        }
+
+        .round-times {
+            display: flex;
+            justify-content: space-between;
+            gap: 12px;
+            margin-top: 6px;
+            color: #b9c2d0;
+            font-size: 12px;
+        }
+
+        .round-progress {
+            height: 6px;
+            margin-top: 10px;
+            border-radius: 999px;
+            overflow: hidden;
+            background: #202938;
+        }
+
+        .round-progress-fill {
+            height: 100%;
+            width: 0%;
+            border-radius: 999px;
+            background: #f0b84b;
+            transition: width .5s ease;
+        }
+
+        .round-countdown {
+            margin-top: 8px;
+            text-align: center;
+            font-size: 20px;
+            font-weight: 900;
+            color: #ffffff;
+        }
+
+        .stats-card {
+            min-height: 350px;
+        }
+
+        .stat-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 15px;
+            padding: 12px 0;
+            border-bottom: 1px solid #202938;
+        }
+
+        .stat-row:last-child {
+            border-bottom: 0;
+        }
+
+        .stat-name {
+            color: #8995a8;
+            font-size: 13px;
+        }
+
+        .stat-value {
+            font-weight: bold;
+            text-align: right;
+        }
+
+        .quality-card {
+            min-height: 350px;
+        }
+
+        .quality-item {
+            margin-bottom: 17px;
+        }
+
+        .quality-header {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 7px;
+            font-size: 12px;
+            font-weight: bold;
+        }
+
+        .quality-track {
+            height: 10px;
+            background: #202938;
+            border-radius: 999px;
+            overflow: hidden;
+        }
+
+        .quality-fill {
+            height: 100%;
+            width: 0%;
+            border-radius: 999px;
+            transition: width 0.4s ease;
+            background: #35d07f;
+        }
+
+        .market-card {
+            grid-column: span 2;
+        }
+
+        .feature-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 10px;
+        }
+
+        .feature {
+            padding: 13px;
+            border: 1px solid #222c3c;
+            border-radius: 12px;
+            background: rgba(9, 13, 20, 0.55);
+        }
+
+        .feature-name {
+            color: #788599;
+            font-size: 10px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+
+        .feature-value {
+            margin-top: 5px;
+            font-size: 14px;
+            font-weight: 800;
+        }
+
+        .paper-card {
+            grid-column: span 3;
+        }
+
+        .paper-grid {
+            display: grid;
+            grid-template-columns: repeat(5, 1fr);
+            gap: 10px;
+        }
+
+        .paper-item {
+            padding: 14px;
+            border: 1px solid #222c3c;
+            border-radius: 12px;
+            background: rgba(9, 13, 20, 0.55);
+        }
+
+        .paper-label {
+            color: #788599;
+            font-size: 10px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+
+        .paper-value {
+            margin-top: 6px;
+            font-size: 14px;
+            font-weight: 800;
+            word-break: break-word;
+        }
+
+        .last-decision {
+            grid-column: span 3;
+        }
+
+        .decision-box {
+            display: grid;
+            grid-template-columns: 1fr 1fr 1fr 1fr;
+            gap: 15px;
+        }
+
+        .decision-item {
+            padding: 15px;
+            border-radius: 12px;
+            background: rgba(9, 13, 20, 0.6);
+            border: 1px solid #222c3c;
+        }
+
+        .decision-label {
+            color: #788599;
+            font-size: 10px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+
+        .decision-value {
+            margin-top: 6px;
+            font-size: 15px;
+            font-weight: 800;
+            word-break: break-word;
+        }
+
+        .chart-card {
+            grid-column: span 3;
+            padding: 22px;
+        }
+
+        .chart-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 15px;
+            margin-bottom: 16px;
+        }
+
+        .chart-title {
+            margin: 0;
+            font-size: 16px;
+            letter-spacing: 1px;
+        }
+
+        .chart-symbol {
+            color: #8f9bad;
+            font-size: 13px;
+        }
+
+        .tradingview-chart {
+            width: 100%;
+            height: 560px;
+            border-radius: 14px;
+            overflow: hidden;
+            border: 1px solid #273143;
+            background: #0b0f16;
+        }
+
+        .tradingview-chart iframe {
+            width: 100%;
+            height: 100%;
+            border: 0;
+        }
+
+        .footer {
+            margin-top: 22px;
+            text-align: center;
+            color: #596578;
+            font-size: 12px;
+        }
+
+        .refresh-info {
+            margin-top: 8px;
+            color: #6f7b8e;
+        }
+
+        @media (max-width: 1050px) {
+            .price-bar {
+                grid-template-columns: repeat(2, 1fr);
+            }
+
+            .paper-grid {
+                grid-template-columns: repeat(3, 1fr);
+            }
+
+            .decision-box {
+                grid-template-columns: repeat(2, 1fr);
+            }
+        }
+
+        @media (max-width: 800px) {
+            .header {
+                flex-direction: column;
+                align-items: flex-start;
+            }
+
+            .grid {
+                grid-template-columns: 1fr;
+            }
+
+            .main-card,
+            .market-card,
+            .paper-card,
+            .last-decision,
+            .chart-card {
+                grid-column: span 1;
+            }
+
+            .feature-grid {
+                grid-template-columns: repeat(2, 1fr);
+            }
+
+            .paper-grid {
+                grid-template-columns: repeat(2, 1fr);
+            }
+
+            .decision-box {
+                grid-template-columns: 1fr;
+            }
+
+            .tradingview-chart {
+                height: 450px;
+            }
+        }
+
+        @media (max-width: 500px) {
+            .price-bar {
+                grid-template-columns: 1fr;
+            }
+
+            .feature-grid,
+            .paper-grid {
+                grid-template-columns: 1fr;
+            }
+
+            .container {
+                width: 94%;
+                padding-top: 20px;
+            }
+
+            .brand h1 {
+                font-size: 25px;
+            }
+        }
+    </style>
+</head>
+
+<body>
+
+<div class="container">
+
+    <header class="header">
+
+        <div class="brand">
+
+            <div class="logo">
+                ⚡
+            </div>
+
+            <div>
+                <h1>ZEUS</h1>
+                <p>15-MINUTE CRYPTO PREDICTION ENGINE</p>
+            </div>
+
+        </div>
+
+        <div class="status">
+
+            <span
+                class="status-dot waiting"
+                id="statusDot">
+            </span>
+
+            <span id="systemStatus">
+                CHECKING...
+            </span>
+
+        </div>
+
+    </header>
+
+
+    <section class="price-bar">
+
+        <div class="price-card">
+
+            <div class="price-label">
+                BTC/USD
+            </div>
+
+            <div
+                class="btc-price"
+                id="btcPrice">
+                $--
+            </div>
+
+        </div>
+
+        <div class="price-card">
+
+            <div class="price-label">
+                UP PROBABILITY
+            </div>
+
+            <div
+                class="metric-value green"
+                id="upProbability">
+                --%
+            </div>
+
+        </div>
+
+        <div class="price-card">
+
+            <div class="price-label">
+                DOWN PROBABILITY
+            </div>
+
+            <div
+                class="metric-value red"
+                id="downProbability">
+                --%
+            </div>
+
+        </div>
+
+        <div class="price-card">
+
+            <div class="price-label">
+                CONFIDENCE
+            </div>
+
+            <div
+                class="metric-value"
+                id="confidence">
+                --%
+            </div>
+
+        </div>
+
+        <div class="price-card">
+
+            <div class="price-label">
+                SIGNAL
+            </div>
+
+            <div
+                class="metric-value yellow"
+                id="signal">
+                SKIP
+            </div>
+
+        </div>
+
+    </section>
+
+
+    <section class="grid">
+
+
+        <div class="card record-card">
+
+            <div class="record-label">
+                Wins
+            </div>
+
+            <div
+                class="record-number win"
+                id="wins">
+                0
+            </div>
+
+        </div>
+
+
+        <div class="card record-card">
+
+            <div class="record-label">
+                Losses
+            </div>
+
+            <div
+                class="record-number loss"
+                id="losses">
+                0
+            </div>
+
+        </div>
+
+
+        <div class="card record-card">
+
+            <div class="record-label">
+                Skips
+            </div>
+
+            <div
+                class="record-number skip"
+                id="skips">
+                0
+            </div>
+
+        </div>
+
+
+        <div class="card main-card">
+
+            <h2 class="section-title">
+                CURRENT ZEUS PREDICTION
+            </h2>
+
+            <div class="prediction-box">
+
+                <div
+                    class="prediction-symbol yellow"
+                    id="predictionSymbol">
+                    ⚡
+                </div>
+
+                <div
+                    class="prediction-status"
+                    id="predictionStatus">
+                    WAITING FOR SIGNAL
+                </div>
+
+                <div
+                    class="prediction-description"
+                    id="predictionDescription">
+                    Zeus is analyzing live market data.
+                </div>
+
+                <div class="probabilities">
+
+                    <div class="probability-row">
+                        <span class="green">UP</span>
+                        <span id="upBarText">--%</span>
+                    </div>
+
+                    <div class="probability-track">
+
+                        <div
+                            class="probability-fill up-fill"
+                            id="upBar">
+                        </div>
+
+                    </div>
+
+
+                    <div class="probability-row">
+                        <span class="red">DOWN</span>
+                        <span id="downBarText">--%</span>
+                    </div>
+
+                    <div class="probability-track">
+
+                        <div
+                            class="probability-fill down-fill"
+                            id="downBar">
+                        </div>
+
+                    </div>
+
+                </div>
+
+                <div class="round-panel">
+
+                    <div class="round-top">
+
+                        <span class="round-label">
+                            15-MINUTE ROUND
+                        </span>
+
+                        <span
+                            class="round-status observing"
+                            id="roundStatus">
+                            OBSERVING MARKET
+                        </span>
+
+                    </div>
+
+                    <div class="round-times">
+
+                        <span id="roundStart">
+                            Start: --
+                        </span>
+
+                        <span id="roundEnd">
+                            End: --
+                        </span>
+
+                    </div>
+
+                    <div class="round-progress">
+
+                        <div
+                            class="round-progress-fill"
+                            id="roundProgress">
+                        </div>
+
+                    </div>
+
+                    <div
+                        class="round-countdown"
+                        id="roundCountdown">
+                        --:-- remaining
+                    </div>
+
+                </div>
+
+                <div class="prediction-meta">
+
+                    <span
+                        class="badge"
+                        id="strengthBadge">
+                        STRENGTH: --
+                    </span>
+
+                    <span
+                        class="badge"
+                        id="conflictBadge">
+                        CONFLICT: --
+                    </span>
+
+                    <span
+                        class="badge"
+                        id="featureBadge">
+                        FEATURES: --%
+                    </span>
+
+                </div>
+
+                <div
+                    class="countdown"
+                    id="countdown">
+                </div>
+
+            </div>
+
+        </div>
+
+
+        <div class="card stats-card">
+
+            <h2 class="section-title">
+                CRYPTO.COM 15-MINUTE MARKET
+            </h2>
+
+            <div class="stat-row">
+                <span class="stat-name">Status</span>
+                <span class="stat-value" id="cryptoMarketStatus">WAITING</span>
+            </div>
+
+            <div class="stat-row">
+                <span class="stat-name">Contract</span>
+                <span class="stat-value" id="cryptoContract">--</span>
+            </div>
+
+            <div class="stat-row">
+                <span class="stat-name">Strike</span>
+                <span class="stat-value" id="cryptoStrike">--</span>
+            </div>
+
+            <div class="stat-row">
+                <span class="stat-name">Operator</span>
+                <span class="stat-value" id="cryptoOperator">--</span>
+            </div>
+
+            <div class="stat-row">
+                <span class="stat-name">BTC Now</span>
+                <span class="stat-value" id="cryptoCurrent">--</span>
+            </div>
+
+            <div class="stat-row">
+                <span class="stat-name">Distance</span>
+                <span class="stat-value" id="cryptoDistance">--</span>
+            </div>
+
+            <div class="stat-row">
+                <span class="stat-name">Opens</span>
+                <span class="stat-value" id="cryptoOpen">--</span>
+            </div>
+
+            <div class="stat-row">
+                <span class="stat-name">Expires</span>
+                <span class="stat-value" id="cryptoClose">--</span>
+            </div>
+
+            <div class="stat-row">
+                <span class="stat-name">Time Left</span>
+                <span class="stat-value" id="cryptoRemaining">--</span>
+            </div>
+
+        </div>
+
+
+        <div class="card stats-card">
+
+            <h2 class="section-title">
+                TODAY'S STATS
+            </h2>
+
+            <div class="stat-row">
+
+                <span class="stat-name">
+                    Date
+                </span>
+
+                <span
+                    class="stat-value"
+                    id="recordDate">
+                    --
+                </span>
+
+            </div>
+
+            <div class="stat-row">
+
+                <span class="stat-name">
+                    Timezone
+                </span>
+
+                <span
+                    class="stat-value"
+                    id="timezone">
+                    --
+                </span>
+
+            </div>
+
+            <div class="stat-row">
+
+                <span class="stat-name">
+                    Total Predictions
+                </span>
+
+                <span
+                    class="stat-value"
+                    id="totalPredictions">
+                    0
+                </span>
+
+            </div>
+
+            <div class="stat-row">
+
+                <span class="stat-name">
+                    Win Rate
+                </span>
+
+                <span
+                    class="stat-value"
+                    id="winRate">
+                    0%
+                </span>
+
+            </div>
+
+            <div class="stat-row">
+
+                <span class="stat-name">
+                    Last Updated
+                </span>
+
+                <span
+                    class="stat-value"
+                    id="updatedAt">
+                    --
+                </span>
+
+            </div>
+
+        </div>
+
+
+        <div class="card quality-card">
+
+            <h2 class="section-title">
+                DATA QUALITY
+            </h2>
+
+            <div class="quality-item">
+
+                <div class="quality-header">
+
+                    <span>
+                        MARKET DATA
+                    </span>
+
+                    <span id="dataQualityText">
+                        --%
+                    </span>
+
+                </div>
+
+                <div class="quality-track">
+
+                    <div
+                        class="quality-fill"
+                        id="dataQualityBar">
+                    </div>
+
+                </div>
+
+            </div>
+
+
+            <div class="quality-item">
+
+                <div class="quality-header">
+
+                    <span>
+                        FEATURE QUALITY
+                    </span>
+
+                    <span id="featureQualityText">
+                        --%
+                    </span>
+
+                </div>
+
+                <div class="quality-track">
+
+                    <div
+                        class="quality-fill"
+                        id="featureQualityBar">
+                    </div>
+
+                </div>
+
+            </div>
+
+
+            <div class="stat-row">
+
+                <span class="stat-name">
+                    Coinbase
+                </span>
+
+                <span
+                    class="stat-value"
+                    id="coinbaseHealth">
+                    --
+                </span>
+
+            </div>
+
+
+            <div class="stat-row">
+
+                <span class="stat-name">
+                    Kraken
+                </span>
+
+                <span
+                    class="stat-value"
+                    id="krakenHealth">
+                    --
+                </span>
+
+            </div>
+
+
+            <div class="stat-row">
+
+                <span class="stat-name">
+                    Trades Stored
+                </span>
+
+                <span
+                    class="stat-value"
+                    id="tradesStored">
+                    --
+                </span>
+
+            </div>
+
+        </div>
+
+
+        <div class="card market-card">
+
+            <h2 class="section-title">
+                LIVE MARKET FEATURES
+            </h2>
+
+            <div class="feature-grid">
+
+
+                <div class="feature">
+
+                    <div class="feature-name">
+                        15s Movement
+                    </div>
+
+                    <div
+                        class="feature-value"
+                        id="movement15">
+                        --
+                    </div>
+
+                </div>
+
+
+                <div class="feature">
+
+                    <div class="feature-name">
+                        30s Movement
+                    </div>
+
+                    <div
+                        class="feature-value"
+                        id="movement30">
+                        --
+                    </div>
+
+                </div>
+
+
+                <div class="feature">
+
+                    <div class="feature-name">
+                        60s Movement
+                    </div>
+
+                    <div
+                        class="feature-value"
+                        id="movement60">
+                        --
+                    </div>
+
+                </div>
+
+
+                <div class="feature">
+
+                    <div class="feature-name">
+                        Book Imbalance
+                    </div>
+
+                    <div
+                        class="feature-value"
+                        id="bookImbalance">
+                        --
+                    </div>
+
+                </div>
+
+
+                <div class="feature">
+
+                    <div class="feature-name">
+                        5-Level Imbalance
+                    </div>
+
+                    <div
+                        class="feature-value"
+                        id="imbalance5">
+                        --
+                    </div>
+
+                </div>
+
+
+                <div class="feature">
+
+                    <div class="feature-name">
+                        10-Level Imbalance
+                    </div>
+
+                    <div
+                        class="feature-value"
+                        id="imbalance10">
+                        --
+                    </div>
+
+                </div>
+
+
+                <div class="feature">
+
+                    <div class="feature-name">
+                        25-Level Imbalance
+                    </div>
+
+                    <div
+                        class="feature-value"
+                        id="imbalance25">
+                        --
+                    </div>
+
+                </div>
+
+
+                <div class="feature">
+
+                    <div class="feature-name">
+                        Trade Pressure 60s
+                    </div>
+
+                    <div
+                        class="feature-value"
+                        id="tradeImbalance60">
+                        --
+                    </div>
+
+                </div>
+
+
+                <div class="feature">
+
+                    <div class="feature-name">
+                        RV 60s
+                    </div>
+
+                    <div
+                        class="feature-value"
+                        id="rv60">
+                        --
+                    </div>
+
+                </div>
+
+
+                <div class="feature">
+
+                    <div class="feature-name">
+                        Avg Spread
+                    </div>
+
+                    <div
+                        class="feature-value"
+                        id="averageSpread">
+                        --
+                    </div>
+
+                </div>
+
+
+                <div class="feature">
+
+                    <div class="feature-name">
+                        Exchange Difference
+                    </div>
+
+                    <div
+                        class="feature-value"
+                        id="exchangeDifference">
+                        --
+                    </div>
+
+                </div>
+
+
+                <div class="feature">
+
+                    <div class="feature-name">
+                        Short-Term Acceleration
+                    </div>
+
+                    <div
+                        class="feature-value"
+                        id="acceleration">
+                        --
+                    </div>
+
+                </div>
+
+            </div>
+
+        </div>
+
+
+        <div class="card paper-card">
+
+            <h2 class="section-title">
+                PAPER PREDICTION
+            </h2>
+
+            <div class="paper-grid">
+
+
+                <div class="paper-item">
+
+                    <div class="paper-label">
+                        Prediction ID
+                    </div>
+
+                    <div
+                        class="paper-value"
+                        id="paperId">
+                        NONE
+                    </div>
+
+                </div>
+
+
+                <div class="paper-item">
+
+                    <div class="paper-label">
+                        Direction
+                    </div>
+
+                    <div
+                        class="paper-value"
+                        id="paperDirection">
+                        NONE
+                    </div>
+
+                </div>
+
+
+                <div class="paper-item">
+
+                    <div class="paper-label">
+                        Entry Price
+                    </div>
+
+                    <div
+                        class="paper-value"
+                        id="paperEntry">
+                        --
+                    </div>
+
+                </div>
+
+
+                <div class="paper-item">
+
+                    <div class="paper-label">
+                        Current Price
+                    </div>
+
+                    <div
+                        class="paper-value"
+                        id="paperCurrent">
+                        --
+                    </div>
+
+                </div>
+
+
+                <div class="paper-item">
+
+                    <div class="paper-label">
+                        Result
+                    </div>
+
+                    <div
+                        class="paper-value"
+                        id="paperResult">
+                        ACTIVE / NONE
+                    </div>
+
+                </div>
+
+            </div>
+
+        </div>
+
+
+        <div class="card last-decision">
+
+            <h2 class="section-title">
+                LAST ZEUS DECISION
+            </h2>
+
+            <div class="decision-box">
+
+
+                <div class="decision-item">
+
+                    <div class="decision-label">
+                        Decision Time
+                    </div>
+
+                    <div
+                        class="decision-value"
+                        id="lastDecisionTime">
+                        --
+                    </div>
+
+                </div>
+
+
+                <div class="decision-item">
+
+                    <div class="decision-label">
+                        Reason
+                    </div>
+
+                    <div
+                        class="decision-value"
+                        id="lastDecisionReason">
+                        --
+                    </div>
+
+                </div>
+
+
+                <div class="decision-item">
+
+                    <div class="decision-label">
+                        Model Score
+                    </div>
+
+                    <div
+                        class="decision-value"
+                        id="modelScore">
+                        --
+                    </div>
+
+                </div>
+
+
+                <div class="decision-item">
+
+                    <div class="decision-label">
+                        Probability Edge
+                    </div>
+
+                    <div
+                        class="decision-value"
+                        id="probabilityEdge">
+                        --
+                    </div>
+
+                </div>
+
+            </div>
+
+        </div>
+
+
+        <div class="card chart-card">
+
+            <div class="chart-header">
+
+                <h2 class="chart-title">
+                    BTC/USD MARKET CHART
+                </h2>
+
+                <div class="chart-symbol">
+                    COINBASE:BTCUSD · 15 MIN
+                </div>
+
+            </div>
+
+            <div class="tradingview-chart">
+
+                <iframe
+                    title="TradingView Coinbase BTC USD chart"
+                    src="https://www.tradingview.com/widgetembed/?frameElementId=tradingview_chart&symbol=COINBASE%3ABTCUSD&interval=15&hidesidetoolbar=0&hidetoptoolbar=0&symboledit=1&saveimage=1&toolbarbg=f1f3f6&studies=%5B%5D&theme=dark&style=1&timezone=America%2FNew_York&withdateranges=1&hideideas=1&hidelegend=0&hidevolume=0&allow_symbol_change=1&calendar=0&hotlist=0&locale=en&enable_publishing=false&hide_side_toolbar=0&show_popup_button=0"
+                    allowtransparency="true"
+                    scrolling="no"
+                    allowfullscreen="true">
+                </iframe>
+
+            </div>
+
+        </div>
+
+    </section>
+
+
+    <footer class="footer">
+
+        <div>
+            ZEUS DEVELOPMENT DASHBOARD
+        </div>
+
+        <div class="refresh-info">
+            Live engine data refreshes every 2 seconds.
+            Trading remains PAPER ONLY.
+        </div>
+
+    </footer>
+
+</div>
+
+
+<script>
+
+    let activePrediction = null;
+
+    let lastTelemetryTimestamp = null;
+
+    let lastDecisionTimestamp = null;
+
+    let currentCryptoMarket = null;
+
+    let currentRound = null;
+
+    let dashboardStatusOnline = false;
+
+
+    function byId(id) {
+        return document.getElementById(id);
+    }
+
+
+    function setText(id, value) {
+
+        const element = byId(id);
+
+        if (element) {
+            element.textContent = value;
+        }
+    }
+
+
+    function numberOrNull(value) {
+
+        const number = Number(value);
+
+        return Number.isFinite(number)
+            ? number
+            : null;
+    }
+
+
+    function formatNumber(value, decimals = 4) {
+
+        const number = numberOrNull(value);
+
+        if (number === null) {
+            return "--";
+        }
+
+        return number.toFixed(decimals);
+    }
+
+
+    function formatPercent(value, decimals = 2) {
+
+        const number = numberOrNull(value);
+
+        if (number === null) {
+            return "--";
+        }
+
+        return `${number.toFixed(decimals)}%`;
+    }
+
+
+    function formatPrice(value) {
+
+        const number = numberOrNull(value);
+
+        if (number === null) {
+            return "$--";
+        }
+
+        return `$${number.toLocaleString(
+            "en-US",
+            {
+                minimumFractionDigits: 2,
+                maximumFractionDigits: 2
+            }
+        )}`;
+    }
+
+
+    function formatTime(timestamp) {
+
+        if (!timestamp) {
+            return "--";
+        }
+
+        const date = new Date(timestamp);
+
+        if (Number.isNaN(date.getTime())) {
+            return "--";
+        }
+
+        return date.toLocaleTimeString(
+            [],
+            {
+                hour: "numeric",
+                minute: "2-digit",
+                second: "2-digit"
+            }
+        );
+    }
+
+
+    function setQualityBar(id, value) {
+
+        const element = byId(id);
+
+        const number = Math.max(
+            0,
+            Math.min(
+                100,
+                Number(value) || 0
+            )
+        );
+
+        if (element) {
+            element.style.width = `${number}%`;
+        }
+    }
+
+
+    function colorize(id, value) {
+
+        const element = byId(id);
+
+        if (!element) {
+            return;
+        }
+
+        element.classList.remove(
+            "green",
+            "red",
+            "yellow"
+        );
+
+        const number = numberOrNull(value);
+
+        if (number === null) {
+            return;
+        }
+
+        if (number > 0) {
+            element.classList.add("green");
+        }
+        else if (number < 0) {
+            element.classList.add("red");
+        }
+    }
+
+
+    function setSignalColor(signal) {
+
+        const element = byId("signal");
+
+        if (!element) {
+            return;
+        }
+
+        element.classList.remove(
+            "green",
+            "red",
+            "yellow"
+        );
+
+        if (signal === "UP") {
+            element.classList.add("green");
+        }
+        else if (signal === "DOWN") {
+            element.classList.add("red");
+        }
+        else {
+            element.classList.add("yellow");
+        }
+    }
+
+
+    function formatRemaining(seconds) {
+
+        const number = numberOrNull(seconds);
+
+        if (number === null) {
+            return "--";
+        }
+
+        const totalSeconds =
+            Math.max(
+                0,
+                Math.ceil(number)
+            );
+
+        const minutes =
+            Math.floor(
+                totalSeconds / 60
+            );
+
+        const secs =
+            totalSeconds % 60;
+
+        return `${minutes}:${String(secs).padStart(2, "0")}`;
+    }
+
+
+    function getValidTimestamp(value) {
+
+        if (!value) {
+            return null;
+        }
+
+        const timestamp =
+            new Date(value).getTime();
+
+        return Number.isFinite(timestamp)
+            ? timestamp
+            : null;
+    }
+
+
+    function getRoundTimes(source) {
+
+        if (!source) {
+            return {
+                openTime: null,
+                closeTime: null
+            };
+        }
+
+        const openTime =
+            source.openTime ||
+            source.startTime ||
+            source.openTimestamp ||
+            source.startTimestamp ||
+            null;
+
+        const closeTime =
+            source.closeTime ||
+            source.endTime ||
+            source.closeTimestamp ||
+            source.endTimestamp ||
+            null;
+
+        return {
+            openTime,
+            closeTime
+        };
+    }
+
+
+    function updateRoundFromBackend(round) {
+
+        if (!round) {
+            return;
+        }
+
+
+        const times =
+            getRoundTimes(round);
+
+
+        /*
+         * IMPORTANT TIMER FIX
+         *
+         * Normalize every round source into the same
+         * openTime / closeTime structure.
+         *
+         * /api/round may use startTime/endTime while the
+         * Crypto.com feed uses openTime/closeTime.
+         *
+         * The live countdown always uses the normalized
+         * timestamps below.
+         */
+
+        currentRound = {
+            ...(currentRound || {}),
+            ...round,
+            openTime:
+                times.openTime ||
+                currentRound?.openTime ||
+                null,
+            closeTime:
+                times.closeTime ||
+                currentRound?.closeTime ||
+                null
+        };
+
+
+        const openTime =
+            currentRound.openTime;
+
+        const closeTime =
+            currentRound.closeTime;
+
+
+        const open =
+            getValidTimestamp(
+                openTime
+            );
+
+
+        const close =
+            getValidTimestamp(
+                closeTime
+            );
+
+
+        const now = Date.now();
+
+
+        if (
+            Number.isFinite(open) &&
+            Number.isFinite(close) &&
+            close > open
+        ) {
+
+            const elapsed =
+                Math.max(
+                    0,
+                    Math.min(
+                        close - open,
+                        now - open
+                    )
+                );
+
+
+            const duration =
+                close - open;
+
+
+            const progress =
+                (elapsed / duration) * 100;
+
+
+            const remaining =
+                Math.max(
+                    0,
+                    close - now
+                );
+
+
+            setText(
+                "roundStart",
+                `Start: ${formatTime(open)}`
+            );
+
+
+            setText(
+                "roundEnd",
+                `End: ${formatTime(close)}`
+            );
+
+
+            setText(
+                "roundCountdown",
+                `${formatRemaining(
+                    remaining / 1000
+                )} remaining`
+            );
+
+
+            const progressBar =
+                byId("roundProgress");
+
+
+            if (progressBar) {
+
+                progressBar.style.width =
+                    `${Math.max(
+                        0,
+                        Math.min(
+                            100,
+                            progress
+                        )
+                    )}%`;
+            }
+        }
+
+
+        const status =
+            String(
+                currentRound.status ||
+                ""
+            ).toUpperCase();
+
+
+        const roundStatus =
+            byId("roundStatus");
+
+
+        if (roundStatus) {
+
+            roundStatus.classList.remove(
+                "observing",
+                "complete"
+            );
+
+
+            if (
+                status.includes("COMPLETE") ||
+                status.includes("CLOSED") ||
+                status.includes("EXPIRED")
+            ) {
+
+                roundStatus.textContent =
+                    "ROUND COMPLETE";
+
+
+                roundStatus.classList.add(
+                    "complete"
+                );
+            }
+            else {
+
+                roundStatus.textContent =
+                    "OBSERVING MARKET";
+
+
+                roundStatus.classList.add(
+                    "observing"
+                );
+            }
+        }
+    }
+
+
+    function updateRoundCountdown() {
+
+        /*
+         * PRIMARY SOURCE:
+         *
+         * Use the normalized currentRound timestamps.
+         */
+
+        let open =
+            getValidTimestamp(
+                currentRound?.openTime
+            );
+
+
+        let close =
+            getValidTimestamp(
+                currentRound?.closeTime
+            );
+
+
+        /*
+         * FALLBACK SOURCE:
+         *
+         * If the round endpoint briefly disappears or
+         * returned another timestamp naming convention,
+         * use the active Crypto.com contract.
+         */
+
+        if (
+            !Number.isFinite(open) ||
+            !Number.isFinite(close)
+        ) {
+
+            const cryptoTimes =
+                getRoundTimes(
+                    currentCryptoMarket
+                );
+
+
+            const cryptoOpen =
+                getValidTimestamp(
+                    cryptoTimes.openTime
+                );
+
+
+            const cryptoClose =
+                getValidTimestamp(
+                    cryptoTimes.closeTime
+                );
+
+
+            if (
+                Number.isFinite(cryptoOpen) &&
+                Number.isFinite(cryptoClose) &&
+                cryptoClose > cryptoOpen
+            ) {
+
+                open = cryptoOpen;
+                close = cryptoClose;
+
+                currentRound = {
+                    ...(currentRound || {}),
+                    openTime:
+                        cryptoTimes.openTime,
+                    closeTime:
+                        cryptoTimes.closeTime
+                };
+            }
+        }
+
+
+        if (
+            Number.isFinite(open) &&
+            Number.isFinite(close) &&
+            close > open
+        ) {
+
+            const now =
+                Date.now();
+
+
+            const duration =
+                close - open;
+
+
+            const elapsed =
+                Math.max(
+                    0,
+                    Math.min(
+                        duration,
+                        now - open
+                    )
+                );
+
+
+            const remaining =
+                Math.max(
+                    0,
+                    close - now
+                );
+
+
+            setText(
+                "roundCountdown",
+                `${formatRemaining(
+                    remaining / 1000
+                )} remaining`
+            );
+
+
+            const progressBar =
+                byId("roundProgress");
+
+
+            if (progressBar) {
+
+                progressBar.style.width =
+                    `${Math.max(
+                        0,
+                        Math.min(
+                            100,
+                            (elapsed / duration) * 100
+                        )
+                    )}%`;
+            }
+
+
+            /*
+             * Keep the displayed times synchronized with
+             * whichever valid source supplied the timer.
+             */
+
+            setText(
+                "roundStart",
+                `Start: ${formatTime(open)}`
+            );
+
+
+            setText(
+                "roundEnd",
+                `End: ${formatTime(close)}`
+            );
+
+
+            if (now >= close) {
+
+                const roundStatus =
+                    byId("roundStatus");
+
+
+                if (roundStatus) {
+
+                    roundStatus.textContent =
+                        "ROUND COMPLETE";
+
+
+                    roundStatus.classList.remove(
+                        "observing"
+                    );
+
+
+                    roundStatus.classList.add(
+                        "complete"
+                    );
+                }
+            }
+
+
+            return;
+        }
+
+
+        setText(
+            "roundCountdown",
+            "--:-- remaining"
+        );
+    }
+
+
+    function updateLiveUpdatedClock() {
+
+        if (!lastTelemetryTimestamp) {
+            return;
+        }
+
+        const ageSeconds = Math.max(
+            0,
+            Math.floor(
+                (Date.now() - lastTelemetryTimestamp) /
+                1000
+            )
+        );
+
+        const element = byId("updatedAt");
+
+        if (!element) {
+            return;
+        }
+
+        if (ageSeconds < 2) {
+            element.textContent = "JUST NOW";
+        }
+        else if (ageSeconds < 60) {
+            element.textContent =
+                `${ageSeconds}s ago`;
+        }
+        else {
+            element.textContent =
+                `${Math.floor(
+                    ageSeconds / 60
+                )}m ago`;
+        }
+    }
+
+
+    async function fetchJson(endpoint) {
+
+        const response =
+            await fetch(
+                endpoint,
+                {
+                    cache: "no-store"
+                }
+            );
+
+        if (!response.ok) {
+            throw new Error(
+                `${endpoint} returned ${response.status}`
+            );
+        }
+
+        return response.json();
+    }
+
+
+    async function loadRecords() {
+
+        const records =
+            await fetchJson(
+                "/api/records"
+            );
+
+        setText(
+            "wins",
+            records.wins ?? 0
+        );
+
+        setText(
+            "losses",
+            records.losses ?? 0
+        );
+
+        setText(
+            "skips",
+            records.skips ?? 0
+        );
+
+        setText(
+            "totalPredictions",
+            records.totalPredictions ?? 0
+        );
+
+        setText(
+            "recordDate",
+            records.date ?? "--"
+        );
+
+        setText(
+            "timezone",
+            records.timezone ?? "--"
+        );
+
+        updateLiveUpdatedClock();
+
+        const wins =
+            Number(records.wins) || 0;
+
+        const losses =
+            Number(records.losses) || 0;
+
+        const completed =
+            wins + losses;
+
+        const winRate =
+            completed > 0
+                ? (wins / completed) * 100
+                : 0;
+
+        setText(
+            "winRate",
+            `${winRate.toFixed(1)}%`
+        );
+    }
+
+
+    async function loadStatus() {
+
+        const status =
+            await fetchJson(
+                "/api/status"
+            );
+
+        dashboardStatusOnline =
+            status.status === "ONLINE";
+
+        const statusTimestamp =
+            new Date(
+                status.timestamp ||
+                Date.now()
+            ).getTime();
+
+        if (
+            Number.isFinite(
+                statusTimestamp
+            )
+        ) {
+            lastTelemetryTimestamp =
+                statusTimestamp;
+        }
+
+        lastDecisionTimestamp =
+            status.engine?.lastDecisionAt
+                ? new Date(
+                    status.engine.lastDecisionAt
+                ).getTime()
+                : null;
+
+
+        setText(
+            "systemStatus",
+            dashboardStatusOnline
+                ? "SYSTEM ONLINE"
+                : "SYSTEM OFFLINE"
+        );
+
+
+        const dot =
+            byId("statusDot");
+
+
+        if (dot) {
+
+            dot.classList.remove(
+                "offline",
+                "waiting"
+            );
+
+            if (!dashboardStatusOnline) {
+                dot.classList.add(
+                    "offline"
+                );
+            }
+            else {
+                dot.classList.add(
+                    "waiting"
+                );
+            }
+        }
+
+
+        if (status.market) {
+
+            setText(
+                "btcPrice",
+                formatPrice(
+                    status.market.price
+                )
+            );
+
+            setText(
+                "dataQualityText",
+                formatPercent(
+                    status.market.dataQuality,
+                    0
+                )
+            );
+
+            setQualityBar(
+                "dataQualityBar",
+                status.market.dataQuality
+            );
+
+            setText(
+                "featureQualityText",
+                formatPercent(
+                    status.market.featureQuality,
+                    0
+                )
+            );
+
+            setQualityBar(
+                "featureQualityBar",
+                status.market.featureQuality
+            );
+        }
+
+
+        if (status.prediction) {
+
+            activePrediction =
+                status.prediction.active ||
+                null;
+        }
+
+
+        setText(
+            "lastDecisionTime",
+            formatTime(
+                status.engine?.lastDecisionAt
+            )
+        );
+
+
+        /*
+         * Crypto.com FALLBACK
+         *
+         * /api/status already exposes cryptoCom.
+         * Keep this data instead of allowing a temporary
+         * /api/crypto response to erase the contract.
+         */
+
+        if (status.cryptoCom) {
+
+            const cryptoStatus =
+                status.cryptoCom;
+
+            const nestedMarket =
+                cryptoStatus.market ||
+                null;
+
+            currentCryptoMarket = {
+                ...(currentCryptoMarket || {}),
+                ...(nestedMarket || {}),
+                ...cryptoStatus
+            };
+
+
+            const cryptoTimes =
+                getRoundTimes(
+                    currentCryptoMarket
+                );
+
+
+            if (
+                cryptoTimes.openTime &&
+                cryptoTimes.closeTime
+            ) {
+
+                updateRoundFromBackend(
+                    {
+                        ...currentCryptoMarket,
+                        openTime:
+                            cryptoTimes.openTime,
+                        closeTime:
+                            cryptoTimes.closeTime
+                    }
+                );
+            }
+        }
+    }
+
+
+    async function loadCryptoMarket() {
+
+        const response =
+            await fetchJson(
+                "/api/crypto"
+            );
+
+
+        const apiMarket =
+            response?.market ||
+            null;
+
+
+        /*
+         * IMPORTANT:
+         *
+         * Do NOT replace currentCryptoMarket with null.
+         *
+         * Crypto.com can briefly return an empty market
+         * while rotating from one 15-minute contract to the
+         * next. The last valid contract must remain visible.
+         */
+
+        if (apiMarket) {
+
+            currentCryptoMarket = {
+                ...(currentCryptoMarket || {}),
+                ...apiMarket
+            };
+        }
+
+
+        const market =
+            currentCryptoMarket;
+
+
+        const apiStatus =
+            response?.status ||
+            {};
+
+
+        if (!market) {
+
+            setText(
+                "cryptoMarketStatus",
+                apiStatus.lastError
+                    ? "ERROR"
+                    : "WAITING"
+            );
+
+            return;
+        }
+
+
+        const strikeAvailable =
+            market.strike != null;
+
+
+        const active =
+            market.active !== false;
+
+
+        setText(
+            "cryptoMarketStatus",
+            strikeAvailable
+                ? (
+                    active
+                        ? "ACTIVE"
+                        : "CLOSED"
+                )
+                : "ACTIVE / NO STRIKE"
+        );
+
+
+        setText(
+            "cryptoContract",
+            market.symbol ||
+            market.contract ||
+            market.contractId ||
+            "--"
+        );
+
+
+        setText(
+            "cryptoStrike",
+            market.strike != null
+                ? formatPrice(
+                    market.strike
+                )
+                : "NOT AVAILABLE"
+        );
+
+
+        setText(
+            "cryptoOperator",
+            market.strikeOperator ||
+            market.operator ||
+            ">"
+        );
+
+
+        const currentPrice =
+            numberOrNull(
+                market.currentPrice
+            ) ??
+            numberOrNull(
+                market.price
+            );
+
+
+        if (currentPrice !== null) {
+
+            setText(
+                "cryptoCurrent",
+                formatPrice(
+                    currentPrice
+                )
+            );
+
+
+            if (
+                market.strike != null
+            ) {
+
+                const distance =
+                    currentPrice -
+                    Number(
+                        market.strike
+                    );
+
+
+                setText(
+                    "cryptoDistance",
+                    `${distance >= 0 ? "+" : ""}${formatPrice(
+                        distance
+                    )}`
+                );
+            }
+            else {
+
+                setText(
+                    "cryptoDistance",
+                    "--"
+                );
+            }
+        }
+        else {
+
+            setText(
+                "cryptoCurrent",
+                byId("btcPrice")
+                    ?.textContent ||
+                "--"
+            );
+
+            setText(
+                "cryptoDistance",
+                "--"
+            );
+        }
+
+
+        const times =
+            getRoundTimes(
+                market
+            );
+
+
+        const openTime =
+            times.openTime;
+
+
+        const closeTime =
+            times.closeTime;
+
+
+        setText(
+            "cryptoOpen",
+            formatTime(
+                openTime
+            )
+        );
+
+
+        setText(
+            "cryptoClose",
+            formatTime(
+                closeTime
+            )
+        );
+
+
+        let seconds =
+            numberOrNull(
+                market.secondsRemaining
+            );
+
+
+        if (
+            seconds === null &&
+            closeTime
+        ) {
+
+            const close =
+                getValidTimestamp(
+                    closeTime
+                );
+
+
+            if (
+                Number.isFinite(close)
+            ) {
+
+                seconds =
+                    Math.max(
+                        0,
+                        (
+                            close -
+                            Date.now()
+                        ) / 1000
+                    );
+            }
+        }
+
+
+        setText(
+            "cryptoRemaining",
+            formatRemaining(
+                seconds
+            )
+        );
+
+
+        if (
+            openTime &&
+            closeTime
+        ) {
+
+            updateRoundFromBackend(
+                {
+                    ...market,
+                    openTime,
+                    closeTime,
+                    status:
+                        market.active === false
+                            ? "CLOSED"
+                            : "ACTIVE"
+                }
+            );
+        }
+    }
+
+
+    async function loadRound() {
+
+        /*
+         * /api/round is useful, but it is NOT a core
+         * dashboard connection.
+         *
+         * If this endpoint temporarily fails during a
+         * contract rollover, the dashboard must continue
+         * operating using the Crypto.com contract data.
+         */
+
+        try {
+
+            const response =
+                await fetchJson(
+                    "/api/round"
+                );
+
+            if (response) {
+
+                updateRoundFromBackend(
+                    response
+                );
+            }
+
+        }
+        catch (error) {
+
+            console.warn(
+                "Zeus round endpoint unavailable:",
+                error.message
+            );
+        }
+    }
+
+
+    async function loadMarket() {
+
+        const market =
+            await fetchJson(
+                "/api/market"
+            );
+
+
+        const marketTimestamp =
+            new Date(
+                market.timestamp ||
+                Date.now()
+            ).getTime();
+
+
+        if (
+            Number.isFinite(
+                marketTimestamp
+            )
+        ) {
+            lastTelemetryTimestamp =
+                marketTimestamp;
+        }
+
+
+        setText(
+            "btcPrice",
+            formatPrice(
+                market.price
+            )
+        );
+
+
+        setText(
+            "dataQualityText",
+            formatPercent(
+                market.dataQuality,
+                0
+            )
+        );
+
+
+        setQualityBar(
+            "dataQualityBar",
+            market.dataQuality
+        );
+
+
+        const movements =
+            market.movements ||
+            {};
+
+
+        const book =
+            market.orderBook ||
+            {};
+
+
+        const combinedBook =
+            book.combined ||
+            {};
+
+
+        const marketFeatures =
+            market.features ||
+            {};
+
+
+        const featureMomentum =
+            marketFeatures.momentum ||
+            {};
+
+
+        const featureOrderBook =
+            marketFeatures.orderBook ||
+            {};
+
+
+        const featureTradePressure =
+            marketFeatures.tradePressure ||
+            {};
+
+
+        const featureVolatility =
+            marketFeatures.volatility ||
+            {};
+
+
+        const featureSpread =
+            marketFeatures.spread ||
+            {};
+
+
+        const featureCrossExchange =
+            marketFeatures.crossExchange ||
+            {};
+
+
+        const featureQuality =
+            marketFeatures.quality ||
+            {};
+
+
+        setText(
+            "movement15",
+            formatPercent(
+                movements[15],
+                4
+            )
+        );
+
+
+        setText(
+            "movement30",
+            formatPercent(
+                movements[30],
+                4
+            )
+        );
+
+
+        setText(
+            "movement60",
+            formatPercent(
+                movements[60],
+                4
+            )
+        );
+
+
+        colorize(
+            "movement15",
+            movements[15]
+        );
+
+
+        colorize(
+            "movement30",
+            movements[30]
+        );
+
+
+        colorize(
+            "movement60",
+            movements[60]
+        );
+
+
+        setText(
+            "bookImbalance",
+            formatNumber(
+                combinedBook.imbalance,
+                4
+            )
+        );
+
+
+        const depths =
+            featureOrderBook.depths ||
+            {};
+
+
+        setText(
+            "imbalance5",
+            formatNumber(
+                depths[5]?.imbalance,
+                4
+            )
+        );
+
+
+        setText(
+            "imbalance10",
+            formatNumber(
+                depths[10]?.imbalance,
+                4
+            )
+        );
+
+
+        setText(
+            "imbalance25",
+            formatNumber(
+                depths[25]?.imbalance,
+                4
+            )
+        );
+
+
+        colorize(
+            "bookImbalance",
+            combinedBook.imbalance
+        );
+
+
+        colorize(
+            "imbalance5",
+            depths[5]?.imbalance
+        );
+
+
+        colorize(
+            "imbalance10",
+            depths[10]?.imbalance
+        );
+
+
+        colorize(
+            "imbalance25",
+            depths[25]?.imbalance
+        );
+
+
+        const trade60 =
+            featureTradePressure[60] ||
+            market.trades?.recent60s ||
+            {};
+
+
+        setText(
+            "tradeImbalance60",
+            formatNumber(
+                trade60.imbalance,
+                4
+            )
+        );
+
+
+        colorize(
+            "tradeImbalance60",
+            trade60.imbalance
+        );
+
+
+        setText(
+            "rv60",
+            formatNumber(
+                featureVolatility.realized60s ??
+                market.volatility?.realized60s,
+                8
+            )
+        );
+
+
+        setText(
+            "averageSpread",
+            formatPercent(
+                featureSpread.averageSpreadPercent,
+                6
+            )
+        );
+
+
+        setText(
+            "exchangeDifference",
+            formatPercent(
+                featureCrossExchange.priceDifferencePercent,
+                6
+            )
+        );
+
+
+        setText(
+            "acceleration",
+            formatPercent(
+                featureMomentum.shortTermAcceleration,
+                4
+            )
+        );
+
+
+        colorize(
+            "acceleration",
+            featureMomentum.shortTermAcceleration
+        );
+
+
+        const quality =
+            numberOrNull(
+                featureQuality.features
+            );
+
+
+        setText(
+            "featureQualityText",
+            formatPercent(
+                quality,
+                0
+            )
+        );
+
+
+        setQualityBar(
+            "featureQualityBar",
+            quality
+        );
+
+
+        const health =
+            market.health ||
+            {};
+
+
+        const coinbaseConnected =
+            health.coinbase?.connected;
+
+
+        const krakenConnected =
+            health.kraken?.connected;
+
+
+        setText(
+            "coinbaseHealth",
+            coinbaseConnected
+                ? "CONNECTED"
+                : "OFFLINE"
+        );
+
+
+        setText(
+            "krakenHealth",
+            krakenConnected
+                ? "CONNECTED"
+                : "OFFLINE"
+        );
+
+
+        setText(
+            "tradesStored",
+            market.trades?.stored ??
+            0
+        );
+
+
+        updateCurrentPaperPrice();
+    }
+
+
+    async function loadProbability() {
+
+        const probability =
+            await fetchJson(
+                "/api/probability"
+            );
+
+
+        const up =
+            numberOrNull(
+                probability.upProbability
+            );
+
+
+        const down =
+            numberOrNull(
+                probability.downProbability
+            );
+
+
+        setText(
+            "upProbability",
+            formatPercent(
+                up
+            )
+        );
+
+
+        setText(
+            "downProbability",
+            formatPercent(
+                down
+            )
+        );
+
+
+        setText(
+            "confidence",
+            formatPercent(
+                probability.confidence
+            )
+        );
+
+
+        setText(
+            "upBarText",
+            formatPercent(
+                up
+            )
+        );
+
+
+        setText(
+            "downBarText",
+            formatPercent(
+                down
+            )
+        );
+
+
+        const upBar =
+            byId("upBar");
+
+
+        const downBar =
+            byId("downBar");
+
+
+        if (upBar) {
+
+            upBar.style.width =
+                `${
+                    Math.max(
+                        0,
+                        Math.min(
+                            100,
+                            up ?? 0
+                        )
+                    )
+                }%`;
+        }
+
+
+        if (downBar) {
+
+            downBar.style.width =
+                `${
+                    Math.max(
+                        0,
+                        Math.min(
+                            100,
+                            down ?? 0
+                        )
+                    )
+                }%`;
+        }
+
+
+        setText(
+            "modelScore",
+            formatNumber(
+                probability.modelScore,
+                4
+            )
+        );
+    }
+
+
+    async function loadSignal() {
+
+        const signal =
+            await fetchJson(
+                "/api/signal"
+            );
+
+
+        const actualSignal =
+            String(
+                signal.signal ||
+                "SKIP"
+            ).toUpperCase();
+
+
+        setText(
+            "signal",
+            actualSignal
+        );
+
+
+        setSignalColor(
+            actualSignal
+        );
+
+
+        if (
+            actualSignal === "UP"
+        ) {
+
+            setText(
+                "predictionStatus",
+                "UP SIGNAL"
+            );
+
+
+            const symbol =
+                byId(
+                    "predictionSymbol"
+                );
+
+
+            symbol.textContent =
+                "▲";
+
+
+            symbol.className =
+                "prediction-symbol green";
+        }
+        else if (
+            actualSignal === "DOWN"
+        ) {
+
+            setText(
+                "predictionStatus",
+                "DOWN SIGNAL"
+            );
+
+
+            const symbol =
+                byId(
+                    "predictionSymbol"
+                );
+
+
+            symbol.textContent =
+                "▼";
+
+
+            symbol.className =
+                "prediction-symbol red";
+        }
+        else {
+
+            setText(
+                "predictionStatus",
+                "NO TRADE SIGNAL"
+            );
+
+
+            const symbol =
+                byId(
+                    "predictionSymbol"
+                );
+
+
+            symbol.textContent =
+                "⚡";
+
+
+            symbol.className =
+                "prediction-symbol yellow";
+        }
+
+
+        setText(
+            "predictionDescription",
+            signal.reason ||
+            "Zeus is analyzing live market data."
+        );
+
+
+        setText(
+            "strengthBadge",
+            `STRENGTH: ${
+                signal.strength ||
+                "--"
+            }`
+        );
+
+
+        setText(
+            "conflictBadge",
+            `CONFLICT: ${
+                formatNumber(
+                    signal.conflict,
+                    3
+                )
+            }`
+        );
+
+
+        setText(
+            "featureBadge",
+            `FEATURES: ${
+                formatPercent(
+                    signal.featureQuality,
+                    0
+                )
+            }`
+        );
+
+
+        setText(
+            "lastDecisionReason",
+            signal.reason ||
+            "--"
+        );
+
+
+        setText(
+            "probabilityEdge",
+            formatPercent(
+                signal.probabilityEdge
+            )
+        );
+    }
+
+
+    async function loadPrediction() {
+
+        const result =
+            await fetchJson(
+                "/api/prediction"
+            );
+
+
+        activePrediction =
+            result.active ||
+            null;
+
+
+        updatePaperPrediction();
+        updatePredictionCountdown();
+    }
+
+
+    function updatePaperPrediction() {
+
+        if (!activePrediction) {
+
+            setText(
+                "paperId",
+                "NONE"
+            );
+
+
+            setText(
+                "paperDirection",
+                "NONE"
+            );
+
+
+            setText(
+                "paperEntry",
+                "--"
+            );
+
+
+            setText(
+                "paperCurrent",
+                "--"
+            );
+
+
+            setText(
+                "paperResult",
+                "NO ACTIVE PREDICTION"
+            );
+
+
+            return;
+        }
+
+
+        setText(
+            "paperId",
+            activePrediction.id ||
+            "NONE"
+        );
+
+
+        setText(
+            "paperDirection",
+            activePrediction.direction ||
+            "NONE"
+        );
+
+
+        setText(
+            "paperEntry",
+            formatPrice(
+                activePrediction.entryPrice
+            )
+        );
+
+
+        const currentPrice =
+            byId("btcPrice")
+                ?.textContent ||
+            "--";
+
+
+        setText(
+            "paperCurrent",
+            currentPrice
+        );
+
+
+        setText(
+            "paperResult",
+            activePrediction.status === "ACTIVE"
+                ? "ACTIVE"
+                : (
+                    activePrediction.result ||
+                    activePrediction.status ||
+                    "--"
+                )
+        );
+
+
+        updatePredictionCountdown();
+    }
+
+
+    function updateCurrentPaperPrice() {
+
+        if (!activePrediction) {
+            return;
+        }
+
+
+        setText(
+            "paperCurrent",
+            byId("btcPrice")
+                ?.textContent ||
+            "--"
+        );
+    }
+
+
+    function updatePredictionCountdown() {
+
+        const countdown =
+            byId("countdown");
+
+
+        if (!countdown) {
+            return;
+        }
+
+
+        if (!activePrediction) {
+
+            countdown.textContent = "";
+
+            return;
+        }
+
+
+        const expiration =
+            new Date(
+                activePrediction.expirationTime
+            ).getTime();
+
+
+        if (
+            !Number.isFinite(
+                expiration
+            )
+        ) {
+
+            countdown.textContent =
+                "ACTIVE";
+
+            return;
+        }
+
+
+        const remaining =
+            Math.max(
+                0,
+                expiration -
+                Date.now()
+            );
+
+
+        const totalSeconds =
+            Math.floor(
+                remaining /
+                1000
+            );
+
+
+        const minutes =
+            Math.floor(
+                totalSeconds /
+                60
+            );
+
+
+        const seconds =
+            totalSeconds %
+            60;
+
+
+        countdown.textContent =
+            `PAPER ${
+                activePrediction.direction
+            } · ${
+                minutes
+            }:${String(
+                seconds
+            ).padStart(
+                2,
+                "0"
+            )}`;
+
+
+        countdown.classList.remove(
+            "green",
+            "red"
+        );
+
+
+        if (
+            activePrediction.direction ===
+            "UP"
+        ) {
+
+            countdown.classList.add(
+                "green"
+            );
+        }
+        else if (
+            activePrediction.direction ===
+            "DOWN"
+        ) {
+
+            countdown.classList.add(
+                "red"
+            );
+        }
+    }
+
+
+    async function safeLoad(name, loader) {
+
+        try {
+
+            await loader();
+
+            return {
+                name,
+                success: true
+            };
+
+        }
+        catch (error) {
+
+            console.warn(
+                `Zeus dashboard ${name} failed:`,
+                error.message
+            );
+
+            return {
+                name,
+                success: false,
+                error
+            };
+        }
+    }
+
+
+    async function refreshDashboard() {
+
+        /*
+         * STATUS IS THE CORE CONNECTION CHECK.
+         *
+         * Other endpoints are allowed to fail individually
+         * without turning the whole dashboard red.
+         */
+
+        let statusResult;
+
+        try {
+
+            await loadStatus();
+
+            statusResult = {
+                success: true
+            };
+
+        }
+        catch (error) {
+
+            statusResult = {
+                success: false,
+                error
+            };
+
+            console.error(
+                "Zeus status endpoint failed:",
+                error
+            );
+        }
+
+
+        const results =
+            await Promise.all([
+                safeLoad(
+                    "records",
+                    loadRecords
+                ),
+
+                safeLoad(
+                    "market",
+                    loadMarket
+                ),
+
+                safeLoad(
+                    "crypto",
+                    loadCryptoMarket
+                ),
+
+                safeLoad(
+                    "round",
+                    loadRound
+                ),
+
+                safeLoad(
+                    "probability",
+                    loadProbability
+                ),
+
+                safeLoad(
+                    "signal",
+                    loadSignal
+                ),
+
+                safeLoad(
+                    "prediction",
+                    loadPrediction
+                )
+            ]);
+
+
+        updateCurrentPaperPrice();
+
+        updatePaperPrediction();
+
+        updateRoundCountdown();
+
+        updateLiveUpdatedClock();
+
+
+        /*
+         * Only show CONNECTION ERROR if the main status
+         * endpoint itself failed.
+         */
+
+        if (!statusResult.success) {
+
+            setText(
+                "systemStatus",
+                "CONNECTION ERROR"
+            );
+
+
+            const dot =
+                byId("statusDot");
+
+
+            if (dot) {
+
+                dot.classList.remove(
+                    "waiting"
+                );
+
+                dot.classList.add(
+                    "offline"
+                );
+            }
+
+        }
+        else if (dashboardStatusOnline) {
+
+            setText(
+                "systemStatus",
+                "SYSTEM ONLINE"
+            );
+
+
+            const dot =
+                byId("statusDot");
+
+
+            if (dot) {
+
+                dot.classList.remove(
+                    "offline"
+                );
+
+                dot.classList.add(
+                    "waiting"
+                );
+            }
+        }
+
+
+        const failedEndpoints =
+            results
+                .filter(
+                    result =>
+                        !result.success
+                )
+                .map(
+                    result =>
+                        result.name
+                );
+
+
+        if (
+            failedEndpoints.length > 0
+        ) {
+
+            console.warn(
+                "Zeus dashboard partial endpoint failures:",
+                failedEndpoints.join(", ")
+            );
+        }
+    }
+
+
+    refreshDashboard();
+
+
+    setInterval(
+        refreshDashboard,
+        2000
+    );
+
+
+    setInterval(
+        updatePredictionCountdown,
+        1000
+    );
+
+
+    setInterval(
+        updateRoundCountdown,
+        1000
+    );
+
+
+    setInterval(
+        updateLiveUpdatedClock,
+        1000
+    );
+
+</script>
+
+</body>
+</html>
