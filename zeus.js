@@ -33,7 +33,9 @@ const {
     recordWin,
     recordLoss,
     recordSkip,
-    rolloverIfNeeded
+    rolloverIfNeeded,
+    initializeRecordManager,
+    flushRecordManager
 } = require('./recordManager');
 
 
@@ -2300,7 +2302,7 @@ function syncCryptoRound(
 ============================================================
 */
 
-function recordPredictionResult(
+async function recordPredictionResult(
     resolvedPrediction
 ) {
 
@@ -2380,7 +2382,7 @@ function recordPredictionResult(
     ) {
 
         const record =
-            recordWin(
+            await recordWin(
                 metadata
             );
 
@@ -2447,7 +2449,7 @@ function recordPredictionResult(
     ) {
 
         const record =
-            recordLoss(
+            await recordLoss(
                 metadata
             );
 
@@ -2555,7 +2557,7 @@ function recordPredictionResult(
 ============================================================
 */
 
-function checkActivePrediction() {
+async function checkActivePrediction() {
 
     const active =
         getActivePrediction();
@@ -2691,7 +2693,7 @@ function checkActivePrediction() {
         result.prediction;
 
 
-    recordPredictionResult(
+    await recordPredictionResult(
         result.prediction
     );
 
@@ -2896,7 +2898,7 @@ function getDecisionSnapshot() {
 ============================================================
 */
 
-function makeDecision() {
+async function makeDecision() {
 
     const now =
         Date.now();
@@ -2931,7 +2933,7 @@ function makeDecision() {
     }
 
 
-    rolloverIfNeeded();
+    await rolloverIfNeeded();
 
 
     const liveSnapshot =
@@ -3382,7 +3384,7 @@ function makeDecision() {
 
         try {
 
-            recordSkip({
+            await recordSkip({
 
                 paper:
                     true,
@@ -3662,7 +3664,7 @@ function makeDecision() {
 ============================================================
 */
 
-function engineTick() {
+async function engineTick() {
 
     if (
         !engineState.running
@@ -3673,7 +3675,7 @@ function engineTick() {
 
     try {
 
-        rolloverIfNeeded();
+        await rolloverIfNeeded();
 
 
         engineState.lastTickAt =
@@ -3686,7 +3688,7 @@ function engineTick() {
         --------------------------------------------------------
         */
 
-        checkActivePrediction();
+        await checkActivePrediction();
 
 
         /*
@@ -4120,7 +4122,7 @@ function engineTick() {
         --------------------------------------------------------
         */
 
-        makeDecision();
+        await makeDecision();
 
 
         engineState.lastError =
@@ -4169,7 +4171,7 @@ function engineTick() {
 ============================================================
 */
 
-function startEngine() {
+async function startEngine() {
 
     if (
         engineState.running
@@ -4415,16 +4417,16 @@ app.get(
 
 app.get(
     '/api/status',
-    (
+    async (
         req,
         res
     ) => {
 
-        rolloverIfNeeded();
+        await rolloverIfNeeded();
 
 
         const records =
-            getRecordSummary();
+            await getRecordSummary();
 
 
         const active =
@@ -4687,15 +4689,15 @@ app.get(
 
 app.get(
     '/api/records',
-    (
+    async (
         req,
         res
     ) => {
 
-        rolloverIfNeeded();
+        await rolloverIfNeeded();
 
         res.json(
-            getRecordSummary()
+            await getRecordSummary()
         );
     }
 );
@@ -4709,18 +4711,20 @@ app.get(
 
 app.get(
     '/api/history',
-    (
+    async (
         req,
         res
     ) => {
 
+        const history =
+            await getHistory();
+
         res.json({
 
             count:
-                getHistory().length,
+                history.length,
 
-            history:
-                getHistory()
+            history
         });
     }
 );
@@ -5267,7 +5271,7 @@ app.get(
 
 app.post(
     '/api/test/win',
-    (
+    async (
         req,
         res
     ) => {
@@ -5280,7 +5284,7 @@ app.post(
 
 
             const record =
-                recordWin({
+                await recordWin({
 
                     test:
                         true,
@@ -5341,7 +5345,7 @@ app.post(
 
 app.post(
     '/api/test/loss',
-    (
+    async (
         req,
         res
     ) => {
@@ -5354,7 +5358,7 @@ app.post(
 
 
             const record =
-                recordLoss({
+                await recordLoss({
 
                     test:
                         true,
@@ -5415,7 +5419,7 @@ app.post(
 
 app.post(
     '/api/test/skip',
-    (
+    async (
         req,
         res
     ) => {
@@ -5428,7 +5432,7 @@ app.post(
 
 
             const record =
-                recordSkip({
+                await recordSkip({
 
                     test:
                         true,
@@ -5490,7 +5494,15 @@ app.post(
 const server =
     app.listen(
         PORT,
-        () => {
+        async () => {
+
+            try {
+                await initializeRecordManager();
+            } catch (error) {
+                console.error('Unable to initialize Supabase record manager:', error.message);
+                console.error('Zeus will not start until the Supabase environment variables are configured.');
+                return;
+            }
 
             console.log('');
 
@@ -5552,7 +5564,7 @@ const server =
 
 
             const records =
-                getRecordSummary();
+                await getRecordSummary();
 
 
             console.log('');
@@ -5586,7 +5598,7 @@ const server =
             );
 
 
-            startEngine();
+            await startEngine();
         }
     );
 

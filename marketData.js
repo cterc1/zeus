@@ -1,2998 +1,900 @@
-const WebSocket = require("ws");
+'use strict';
 
-// ============================================================
-// ZEUS MARKET DATA ENGINE
-// Coinbase Advanced Trade + Kraken Spot WebSocket v2
-// ============================================================
+const axios = require('axios');
+
+/*
+ * Zeus Crypto.com prediction-market connector
+ *
+ * This module is READ-ONLY. It never places orders.
+ *
+ * Why this version exists:
+ * The older connector queried DCM /public/get-instruments and expected the
+ * active BTC 15-minute strike to be directly exposed on the instrument.
+ * Crypto.com's current public Predictions API separately exposes prediction
+ * EVENTS and their CONTRACTS, so this connector uses that API first and keeps
+ * the DCM instrument endpoint as a secondary fallback.
+ */
 
 const CONFIG = {
-    coinbase: {
-        wsUrl: "wss://advanced-trade-ws.coinbase.com",
-        productId: "BTC-USD"
-    },
+    pollIntervalMs: 5000,
+    requestTimeoutMs: 10000,
 
-    kraken: {
-        wsUrl: "wss://ws.kraken.com/v2",
-        symbol: "BTC/USD"
-    },
+    minimumDurationMs: 10 * 60 * 1000,
+    maximumDurationMs: 20 * 60 * 1000,
+    targetDurationMs: 15 * 60 * 1000,
 
-    reportIntervalMs: 5000,
-    reconnectDelayMs: 3000,
+    btcNames: [
+        'BTC',
+        'BTCUSD',
+        'BTCUSDT',
+        'BITCOIN'
+    ],
 
-    krakenBookDepth: 100,
-
-    maxTrades: 5000,
-    maxPriceHistory: 5000,
-
-    priceWindows: [15, 30, 60, 180, 300],
-
-    featureWindows: [15, 30, 60],
-
-    bookDepths: [5, 10, 25, 50, 100]
+    predictionsBaseUrl: 'https://data-api.crypto.com/api/v1/predictions',
+    dcmBaseUrl: 'https://api.crypto.com/dcm/v1'
 };
-
-// ============================================================
-// STATE
-// ============================================================
 
 const state = {
-    running: true,
-
-    price: null,
-    lastPriceSource: null,
-
-    priceHistory: [],
-
-    trades: [],
-
-    exchanges: {
-        coinbase: {
-            connected: false,
-            lastMessageAt: 0,
-            lastPriceAt: 0,
-
-            bids: new Map(),
-            asks: new Map(),
-
-            lastBookAt: 0,
-            bookInitialized: false
-        },
-
-        kraken: {
-            connected: false,
-            lastMessageAt: 0,
-            lastPriceAt: 0,
-
-            bids: new Map(),
-            asks: new Map(),
-
-            lastBookAt: 0,
-            bookInitialized: false
-        }
-    },
-
-    stats: {
-        startedAt: Date.now(),
-        messages: {
-            coinbase: 0,
-            kraken: 0
-        }
-    }
+    running: false,
+    lastPollAt: null,
+    lastSuccessAt: null,
+    lastError: null,
+    activeMarket: null,
+    source: null,
+    eventsSeen: 0,
+    contractsSeen: 0,
+    btcEventsSeen: 0,
+    btcContractsSeen: 0,
+    instrumentsSeen: 0,
+    btcBinaryInstrumentsSeen: 0
 };
 
-// ============================================================
-// UTILITY
-// ============================================================
+let timer = null;
 
-function now() {
-    return Date.now();
-}
+function safeNumber(value, fallback = null) {
+    if (value === null || value === undefined || value === '') {
+        return fallback;
+    }
 
-function isFiniteNumber(value) {
-    return Number.isFinite(Number(value));
-}
+    if (typeof value === 'string') {
+        const cleaned = value.replace(/[$,%\s,]/g, '');
+        const n = Number(cleaned);
+        return Number.isFinite(n) ? n : fallback;
+    }
 
-function safeNumber(value, fallback = 0) {
     const n = Number(value);
     return Number.isFinite(n) ? n : fallback;
 }
 
-function clamp(value, min, max) {
-    return Math.max(min, Math.min(max, value));
-}
-
-function percentChange(oldPrice, newPrice) {
-    if (
-        !Number.isFinite(oldPrice) ||
-        !Number.isFinite(newPrice) ||
-        oldPrice === 0
-    ) {
+function parseTime(value) {
+    if (value === null || value === undefined || value === '') {
         return null;
     }
 
-    return ((newPrice - oldPrice) / oldPrice) * 100;
-}
+    if (value instanceof Date) {
+        const n = value.getTime();
+        return Number.isFinite(n) ? n : null;
+    }
 
-function average(values) {
-    const valid = values.filter(
-        value => Number.isFinite(value)
+    if (typeof value === 'number' || /^\d+(?:\.\d+)?$/.test(String(value).trim())) {
+        const n = Number(value);
+
+        if (!Number.isFinite(n)) {
+            return null;
+        }
+
+        if (n > 1e17) return n / 1e6;
+        if (n > 1e14) return n / 1e6;
+        if (n > 1e12) return n;
+        if (n > 1e9) return n * 1000;
+
+        return null;
+    }
+
+    const text = String(value).trim();
+
+    const compact = text.match(
+        /^(\d{4})(\d{2})(\d{2})[-_](\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?$/
     );
 
-    if (valid.length === 0) {
-        return null;
+    if (compact) {
+        const iso = `${compact[1]}-${compact[2]}-${compact[3]}T${compact[4]}:${compact[5]}:${compact[6]}.${(compact[7] || '000').padEnd(3, '0')}Z`;
+        const parsed = Date.parse(iso);
+        return Number.isFinite(parsed) ? parsed : null;
     }
+
+    const parsed = Date.parse(text);
+    return Number.isFinite(parsed) ? parsed : null;
+}
+
+function normalizeSymbol(value) {
+    return String(value || '')
+        .toUpperCase()
+        .replace(/[^A-Z0-9]/g, '');
+}
+
+function normalizeText(value) {
+    return String(value || '')
+        .toUpperCase()
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
+function isBtcText(value) {
+    const text = normalizeText(value);
+    if (!text) return false;
 
     return (
-        valid.reduce(
-            (sum, value) => sum + value,
-            0
-        ) / valid.length
+        /\bBTC\b/.test(text) ||
+        /\bBITCOIN\b/.test(text) ||
+        normalizeSymbol(text).includes('BITCOIN') ||
+        normalizeSymbol(text).startsWith('BTC')
     );
 }
 
-function round(value, decimals = 6) {
-    if (!Number.isFinite(value)) {
-        return null;
+function objectValues(object) {
+    if (!object || typeof object !== 'object') {
+        return [];
     }
 
-    const factor = Math.pow(10, decimals);
+    return Object.entries(object).flatMap(([key, value]) => {
+        if (value && typeof value === 'object') {
+            return [key, ...objectValues(value)];
+        }
 
-    return Math.round(value * factor) / factor;
+        return [key, value];
+    });
 }
 
-// ============================================================
-// PRICE HISTORY
-// ============================================================
+function objectEntriesDeep(object, prefix = '') {
+    const output = [];
 
-function addPricePoint(price, source) {
-    if (!isFiniteNumber(price)) {
-        return;
+    if (!object || typeof object !== 'object') {
+        return output;
     }
 
-    const point = {
-        timestamp: now(),
-        price: Number(price),
-        source
-    };
+    for (const [key, value] of Object.entries(object)) {
+        const path = prefix ? `${prefix}.${key}` : key;
+        output.push({ key, path, value });
 
-    state.price = point.price;
-    state.lastPriceSource = source;
-
-    state.priceHistory.push(point);
-
-    const cutoff = now() - 10 * 60 * 1000;
-
-    while (
-        state.priceHistory.length > 0 &&
-        state.priceHistory[0].timestamp < cutoff
-    ) {
-        state.priceHistory.shift();
-    }
-
-    if (state.priceHistory.length > CONFIG.maxPriceHistory) {
-        state.priceHistory.splice(
-            0,
-            state.priceHistory.length - CONFIG.maxPriceHistory
-        );
-    }
-}
-
-function getPriceMovement(seconds) {
-    if (
-        state.priceHistory.length === 0 ||
-        state.price === null
-    ) {
-        return null;
-    }
-
-    const targetTime = now() - seconds * 1000;
-
-    let closest = null;
-
-    for (
-        let i = state.priceHistory.length - 1;
-        i >= 0;
-        i--
-    ) {
-        const point = state.priceHistory[i];
-
-        if (point.timestamp <= targetTime) {
-            closest = point;
-            break;
+        if (value && typeof value === 'object') {
+            output.push(...objectEntriesDeep(value, path));
         }
     }
 
-    if (!closest) {
-        return null;
-    }
-
-    return percentChange(
-        closest.price,
-        state.price
-    );
+    return output;
 }
 
-// ============================================================
-// PRICE LOOKUP
-// ============================================================
+function findFirstByKeys(object, keys) {
+    const wanted = new Set(keys.map(key => String(key).toLowerCase()));
 
-function getLatestPriceForExchange(exchangeName) {
-    for (
-        let i = state.priceHistory.length - 1;
-        i >= 0;
-        i--
-    ) {
-        const point = state.priceHistory[i];
-
-        if (
-            point.source === exchangeName ||
-            point.source === `${exchangeName}-trade`
-        ) {
-            return {
-                price: point.price,
-                timestamp: point.timestamp,
-                source: point.source
-            };
+    for (const entry of objectEntriesDeep(object)) {
+        if (wanted.has(String(entry.key).toLowerCase())) {
+            if (entry.value !== null && entry.value !== undefined && entry.value !== '') {
+                return entry.value;
+            }
         }
     }
 
     return null;
 }
 
-// ============================================================
-// TRADE STORAGE
-// ============================================================
+function findTimeByKeys(object, keys) {
+    const wanted = keys.map(key => String(key).toLowerCase());
 
-function addTrade({
-    price,
-    quantity,
-    side,
-    exchange,
-    timestamp
-}) {
-    const tradePrice = safeNumber(price);
-    const tradeQuantity = safeNumber(quantity);
+    for (const entry of objectEntriesDeep(object)) {
+        const key = String(entry.key).toLowerCase();
 
-    if (
-        tradePrice <= 0 ||
-        tradeQuantity <= 0
-    ) {
-        return;
+        if (!wanted.includes(key)) {
+            continue;
+        }
+
+        const parsed = parseTime(entry.value);
+
+        if (parsed !== null) {
+            return parsed;
+        }
     }
 
-    state.trades.push({
-        timestamp: timestamp || now(),
-        price: tradePrice,
-        quantity: tradeQuantity,
-        side: side || "unknown",
-        exchange
-    });
-
-    const cutoff = now() - 10 * 60 * 1000;
-
-    while (
-        state.trades.length > 0 &&
-        state.trades[0].timestamp < cutoff
-    ) {
-        state.trades.shift();
-    }
-
-    if (state.trades.length > CONFIG.maxTrades) {
-        state.trades.splice(
-            0,
-            state.trades.length - CONFIG.maxTrades
-        );
-    }
+    return null;
 }
 
-// ============================================================
-// COINBASE
-// ============================================================
+function findStrikeInText(text) {
+    const value = String(text || '');
 
-let coinbaseWs = null;
-let coinbaseReconnectTimer = null;
+    const patterns = [
+        /(?:ABOVE|OVER|GREATER THAN|EXCEEDS?|HIGHER THAN|AT LEAST|BELOW|UNDER|LESS THAN|LOWER THAN|AT MOST)[^$0-9]{0,40}\$?\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.\d+)?)/i,
+        /\$\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.\d+)?)/i,
+        /\b([0-9]{2,3}(?:,[0-9]{3})+(?:\.\d+)?)\s*(?:USD|US DOLLARS?)\b/i,
+        /\b(?:BTC|BITCOIN)[^0-9]{0,50}([0-9]{2,3}(?:,[0-9]{3})+(?:\.\d+)?)/i
+    ];
 
-function connectCoinbase() {
-    if (!state.running) {
-        return;
+    for (const pattern of patterns) {
+        const match = value.match(pattern);
+
+        if (!match) continue;
+
+        const n = safeNumber(match[1]);
+
+        if (n !== null && n > 1000) {
+            return n;
+        }
     }
 
-    console.log("[Coinbase] Connecting...");
+    return null;
+}
+
+function extractStrike(object) {
+    const strikeKeys = [
+        'strike_price',
+        'strikePrice',
+        'strike',
+        'strike_value',
+        'strikeValue',
+        'threshold',
+        'threshold_price',
+        'thresholdPrice',
+        'barrier',
+        'barrier_price',
+        'barrierPrice',
+        'target_price',
+        'targetPrice',
+        'price_threshold',
+        'priceThreshold'
+    ];
+
+    for (const key of strikeKeys) {
+        const value = findFirstByKeys(object, [key]);
+        const n = safeNumber(value);
+
+        if (n !== null && n > 1000) {
+            return n;
+        }
+    }
+
+    for (const entry of objectEntriesDeep(object)) {
+        const key = normalizeText(entry.key);
+
+        if (!/(STRIKE|THRESHOLD|BARRIER|TARGET).*PRICE|STRIKE|THRESHOLD|BARRIER/.test(key)) {
+            continue;
+        }
+
+        const n = safeNumber(entry.value);
+
+        if (n !== null && n > 1000) {
+            return n;
+        }
+    }
+
+    const textValues = objectValues(object)
+        .filter(value => typeof value === 'string')
+        .join(' | ');
+
+    return findStrikeInText(textValues);
+}
+
+function extractOperator(object) {
+    const operatorKeys = [
+        'strike_operator',
+        'strikeOperator',
+        'operator',
+        'comparison_operator',
+        'comparisonOperator',
+        'condition'
+    ];
+
+    for (const key of operatorKeys) {
+        const value = findFirstByKeys(object, [key]);
+
+        if (value !== null) {
+            const text = normalizeText(value);
+
+            if (text.includes('GREATER') || text === 'OVER' || text === 'ABOVE') return '>';
+            if (text.includes('LESS') || text === 'UNDER' || text === 'BELOW') return '<';
+            if (text.includes('EQUAL') || text === 'AT') return '=';
+            if (['>', '>=', '<', '<=', '='].includes(String(value).trim())) {
+                return String(value).trim();
+            }
+        }
+    }
+
+    const text = objectValues(object)
+        .filter(value => typeof value === 'string')
+        .join(' | ')
+        .toUpperCase();
+
+    if (/\b(?:ABOVE|OVER|GREATER THAN|EXCEEDS?|HIGHER THAN)\b/.test(text)) return '>';
+    if (/\b(?:BELOW|UNDER|LESS THAN|LOWER THAN)\b/.test(text)) return '<';
+
+    return null;
+}
+
+function extractOpenClose(object) {
+    const open = findTimeByKeys(object, [
+        'open_time',
+        'openTime',
+        'start_time',
+        'startTime',
+        'opened_at',
+        'openedAt',
+        'market_open_time',
+        'marketOpenTime',
+        'open_timestamp',
+        'openTimestamp'
+    ]);
+
+    const close = findTimeByKeys(object, [
+        'close_time',
+        'closeTime',
+        'end_time',
+        'endTime',
+        'expires_at',
+        'expiresAt',
+        'expiry_time',
+        'expiryTime',
+        'expiration_time',
+        'expirationTime',
+        'expiry_timestamp',
+        'expiryTimestamp',
+        'event_end_date',
+        'eventEndDate'
+    ]);
+
+    return { open, close };
+}
+
+function extractEventDate(object) {
+    return findTimeByKeys(object, [
+        'event_date',
+        'eventDate',
+        'start_time',
+        'startTime',
+        'open_time',
+        'openTime'
+    ]);
+}
+
+function collectText(object) {
+    return objectValues(object)
+        .filter(value => value !== null && value !== undefined)
+        .map(value => String(value))
+        .join(' | ');
+}
+
+function looksLikeBtcEvent(event) {
+    const text = collectText(event);
+
+    return isBtcText(text);
+}
+
+function looksLikeCrypto15MinuteMarket(event, contract = null) {
+    const text = normalizeText(`${collectText(event)} ${collectText(contract || {})}`);
+
+    if (!isBtcText(text)) {
+        return false;
+    }
+
+    return (
+        /15\s*(?:MIN|MINS|MINUTE|MINUTES)/.test(text) ||
+        /QUICK|SHORT[- ]TERM|INTRADAY/.test(text) ||
+        /ABOVE|BELOW|OVER|UNDER/.test(text)
+    );
+}
+
+function getContractsFromEvent(event) {
+    if (Array.isArray(event?.contracts)) {
+        return event.contracts;
+    }
+
+    if (Array.isArray(event?.contract_list)) {
+        return event.contract_list;
+    }
+
+    if (Array.isArray(event?.contractList)) {
+        return event.contractList;
+    }
+
+    return [];
+}
+
+function unwrapData(response) {
+    return (
+        response?.data?.data ||
+        response?.data?.result?.data ||
+        response?.data?.result ||
+        response?.data ||
+        []
+    );
+}
+
+async function getPredictionEvents() {
+    const urls = [
+        `${CONFIG.predictionsBaseUrl}/events`,
+        `${CONFIG.predictionsBaseUrl}/events/search`
+    ];
+
+    const results = [];
 
     try {
-        coinbaseWs = new WebSocket(
-            CONFIG.coinbase.wsUrl
-        );
-
-        coinbaseWs.on("open", () => {
-            console.log("[Coinbase] Connected.");
-
-            state.exchanges.coinbase.connected = true;
-            state.exchanges.coinbase.lastMessageAt = now();
-
-            subscribeCoinbase();
+        const response = await axios.get(urls[0], {
+            params: {
+                status: 'active',
+                limit: 50
+            },
+            timeout: CONFIG.requestTimeoutMs,
+            headers: { Accept: 'application/json' }
         });
 
-        coinbaseWs.on("message", raw => {
-            handleCoinbaseMessage(raw);
-        });
+        const data = unwrapData(response);
 
-        coinbaseWs.on("error", error => {
-            console.log(
-                "[Coinbase] Error:",
-                error.message || error
-            );
-        });
-
-        coinbaseWs.on("close", () => {
-            state.exchanges.coinbase.connected = false;
-
-            console.log("[Coinbase] Disconnected.");
-
-            scheduleCoinbaseReconnect();
-        });
+        if (Array.isArray(data)) {
+            results.push(...data);
+        }
     } catch (error) {
-        console.log(
-            "[Coinbase] Connection error:",
-            error.message || error
-        );
-
-        scheduleCoinbaseReconnect();
-    }
-}
-
-function subscribeCoinbase() {
-    if (
-        !coinbaseWs ||
-        coinbaseWs.readyState !== WebSocket.OPEN
-    ) {
-        return;
+        state.lastError = {
+            source: 'PREDICTIONS_EVENTS',
+            message: error.message,
+            timestamp: new Date().toISOString()
+        };
     }
 
-    coinbaseWs.send(
-        JSON.stringify({
-            type: "subscribe",
-            channel: "heartbeats",
-            product_ids: [
-                CONFIG.coinbase.productId
-            ]
-        })
-    );
+    // Search is a useful fallback because the active-events list can contain
+    // a broad universe and the BTC contract may not be in the first page.
+    try {
+        const response = await axios.get(urls[1], {
+            params: {
+                q: 'BTC',
+                limit: 50
+            },
+            timeout: CONFIG.requestTimeoutMs,
+            headers: { Accept: 'application/json' }
+        });
 
-    coinbaseWs.send(
-        JSON.stringify({
-            type: "subscribe",
-            channel: "level2",
-            product_ids: [
-                CONFIG.coinbase.productId
-            ]
-        })
-    );
+        const data = unwrapData(response);
 
-    coinbaseWs.send(
-        JSON.stringify({
-            type: "subscribe",
-            channel: "ticker",
-            product_ids: [
-                CONFIG.coinbase.productId
-            ]
-        })
-    );
+        if (Array.isArray(data)) {
+            results.push(...data);
+        }
+    } catch (error) {
+        // Search failure is not fatal when the main events endpoint worked.
+    }
 
-    coinbaseWs.send(
-        JSON.stringify({
-            type: "subscribe",
-            channel: "market_trades",
-            product_ids: [
-                CONFIG.coinbase.productId
-            ]
-        })
-    );
+    const unique = new Map();
+
+    for (const event of results) {
+        const id = event?.id || event?.event_id || event?.eventId || event?.symbol || JSON.stringify(event);
+        unique.set(String(id), event);
+    }
+
+    return [...unique.values()];
 }
 
-function handleCoinbaseMessage(raw) {
-    let message;
+async function getEventContracts(eventId) {
+    if (!eventId) return [];
 
     try {
-        message = JSON.parse(
-            raw.toString()
+        const response = await axios.get(
+            `${CONFIG.predictionsBaseUrl}/events/${encodeURIComponent(eventId)}/contracts`,
+            {
+                timeout: CONFIG.requestTimeoutMs,
+                headers: { Accept: 'application/json' }
+            }
         );
-    } catch {
-        return;
-    }
 
-    state.stats.messages.coinbase++;
-
-    state.exchanges.coinbase.lastMessageAt = now();
-
-    const channel = message.channel;
-
-    if (!channel) {
-        return;
-    }
-
-    // --------------------------------------------------------
-    // LEVEL 2
-    // --------------------------------------------------------
-
-    if (
-        channel === "l2_data" ||
-        channel === "level2"
-    ) {
-        handleCoinbaseBook(message);
-        return;
-    }
-
-    // --------------------------------------------------------
-    // TICKER
-    // --------------------------------------------------------
-
-    if (channel === "ticker") {
-        const events = Array.isArray(
-            message.events
-        )
-            ? message.events
-            : [];
-
-        for (const event of events) {
-            const tickers = Array.isArray(
-                event.tickers
-            )
-                ? event.tickers
-                : [];
-
-            for (const ticker of tickers) {
-                const productId =
-                    ticker.product_id ||
-                    ticker.productId;
-
-                if (
-                    productId &&
-                    productId !==
-                        CONFIG.coinbase.productId
-                ) {
-                    continue;
-                }
-
-                const price =
-                    ticker.price ??
-                    ticker.last_trade_price;
-
-                if (isFiniteNumber(price)) {
-                    addPricePoint(
-                        Number(price),
-                        "coinbase"
-                    );
-
-                    state.exchanges.coinbase.lastPriceAt =
-                        now();
-                }
-            }
-        }
-
-        return;
-    }
-
-    // --------------------------------------------------------
-    // MARKET TRADES
-    // --------------------------------------------------------
-
-    if (channel === "market_trades") {
-        const events = Array.isArray(
-            message.events
-        )
-            ? message.events
-            : [];
-
-        for (const event of events) {
-            const trades = Array.isArray(
-                event.trades
-            )
-                ? event.trades
-                : [];
-
-            for (const trade of trades) {
-                const productId =
-                    trade.product_id ||
-                    trade.productId;
-
-                if (
-                    productId &&
-                    productId !==
-                        CONFIG.coinbase.productId
-                ) {
-                    continue;
-                }
-
-                const price = safeNumber(
-                    trade.price ??
-                    trade.trade_price
-                );
-
-                const quantity = safeNumber(
-                    trade.size ??
-                    trade.trade_size
-                );
-
-                let timestamp = now();
-
-                if (trade.time) {
-                    const parsed =
-                        Date.parse(
-                            trade.time
-                        );
-
-                    if (
-                        Number.isFinite(
-                            parsed
-                        )
-                    ) {
-                        timestamp = parsed;
-                    }
-                }
-
-                if (trade.trade_time) {
-                    const parsed =
-                        Date.parse(
-                            trade.trade_time
-                        );
-
-                    if (
-                        Number.isFinite(
-                            parsed
-                        )
-                    ) {
-                        timestamp = parsed;
-                    }
-                }
-
-                addTrade({
-                    price,
-                    quantity,
-                    side:
-                        trade.side ||
-                        trade.aggressor_side ||
-                        "unknown",
-                    exchange: "coinbase",
-                    timestamp
-                });
-
-                if (price > 0) {
-                    addPricePoint(
-                        price,
-                        "coinbase-trade"
-                    );
-                }
-            }
-        }
+        const data = unwrapData(response);
+        return Array.isArray(data) ? data : [];
+    } catch (error) {
+        return [];
     }
 }
 
-// ============================================================
-// COINBASE ORDER BOOK
-// ============================================================
+function chooseTimePair(event, contract) {
+    const eventTimes = extractOpenClose(event);
+    const contractTimes = extractOpenClose(contract);
 
-function handleCoinbaseBook(message) {
-    const book =
-        state.exchanges.coinbase;
+    const open = contractTimes.open ?? eventTimes.open ?? extractEventDate(event);
+    const close = contractTimes.close ?? eventTimes.close;
 
-    const events = Array.isArray(
-        message.events
-    )
-        ? message.events
-        : [];
+    return { open, close };
+}
+
+function duration(open, close) {
+    return open != null && close != null && close > open
+        ? close - open
+        : null;
+}
+
+function isCurrent15m(open, close, now = Date.now()) {
+    if (open == null || close == null) return false;
+
+    const d = close - open;
+
+    if (d < CONFIG.minimumDurationMs || d > CONFIG.maximumDurationMs) {
+        return false;
+    }
+
+    return now >= open && now < close;
+}
+
+function scoreCandidate(candidate, now = Date.now()) {
+    const d = duration(candidate.openTimeMs, candidate.closeTimeMs);
+    let score = 0;
+
+    if (candidate.strike !== null) score += 5000;
+    if (candidate.btc) score += 1000;
+    if (candidate.is15mText) score += 1000;
+    if (candidate.openTimeMs != null && candidate.closeTimeMs != null) score += 1000;
+
+    if (d != null) {
+        score -= Math.abs(d - CONFIG.targetDurationMs) / 1000;
+    }
+
+    if (candidate.closeTimeMs != null) {
+        score += Math.min(Math.max(candidate.closeTimeMs - now, 0) / 1000, 900) / 10;
+    }
+
+    return score;
+}
+
+function normalizePredictionMarket(event, contract, now = Date.now()) {
+    const { open, close } = chooseTimePair(event, contract);
+    const combined = {
+        event,
+        contract,
+        metadata: event?.metadata || event?.meta || {}
+    };
+
+    const strike = extractStrike(combined);
+    const strikeOperator = extractOperator(combined);
+
+    const eventId = event?.id || event?.event_id || event?.eventId || null;
+    const contractId = contract?.id || contract?.contract_id || contract?.contractId || null;
+    const symbol = contract?.symbol || contract?.ticker || contract?.code || event?.symbol || null;
+    const title =
+        contract?.title ||
+        contract?.name ||
+        contract?.description ||
+        event?.title ||
+        event?.name ||
+        null;
+
+    const d = duration(open, close);
+
+    return {
+        available: true,
+        source: 'CRYPTO.COM_PREDICTIONS_API',
+        eventId,
+        contractId,
+        symbol,
+        displayName: title,
+        title,
+        instrumentType: 'PREDICTION_CONTRACT',
+        underlying: 'BTC',
+        strike,
+        strikeAvailable: strike !== null,
+        strikeOperator,
+        openTime: open != null ? new Date(open).toISOString() : null,
+        closeTime: close != null ? new Date(close).toISOString() : null,
+        openTimestampMs: open,
+        closeTimestampMs: close,
+        durationMs: d,
+        durationMinutes: d != null ? d / 60000 : null,
+        secondsRemaining: close != null
+            ? Math.max(0, Math.ceil((close - now) / 1000))
+            : null,
+        tradable: Boolean(
+            contract?.tradable ??
+            contract?.is_tradable ??
+            contract?.active ??
+            event?.tradable ??
+            true
+        ),
+        status: event?.status || contract?.status || 'active',
+        yesContract: contract?.yes || contract?.outcome === 'YES' || contract?.side === 'YES' ? contract : null,
+        event,
+        contract,
+        raw: combined
+    };
+}
+
+function candidateIsUsable(market, now = Date.now()) {
+    if (!market) return false;
+    if (!isCurrent15m(market.openTimestampMs, market.closeTimestampMs, now)) return false;
+    if (market.strike === null) return false;
+    return true;
+}
+
+async function pollPredictionApi() {
+    const now = Date.now();
+    const events = await getPredictionEvents();
+
+    state.eventsSeen = events.length;
+    state.btcEventsSeen = events.filter(looksLikeBtcEvent).length;
+
+    const candidates = [];
 
     for (const event of events) {
-        const productId =
-            event.product_id ||
-            event.productId;
-
-        if (
-            productId &&
-            productId !==
-                CONFIG.coinbase.productId
-        ) {
+        if (!looksLikeBtcEvent(event)) {
             continue;
         }
 
-        const updates = Array.isArray(
-            event.updates
-        )
-            ? event.updates
-            : [];
+        const eventId = event?.id || event?.event_id || event?.eventId;
+        let contracts = getContractsFromEvent(event);
 
-        if (updates.length === 0) {
-            continue;
+        if (contracts.length === 0 && eventId) {
+            contracts = await getEventContracts(eventId);
         }
 
-        if (event.type === "snapshot") {
-            book.bids.clear();
-            book.asks.clear();
+        state.contractsSeen += contracts.length;
+        state.btcContractsSeen += contracts.length;
+
+        if (contracts.length === 0) {
+            // Some API responses put enough contract information directly on
+            // the event. Treat the event itself as a candidate.
+            contracts = [event];
         }
 
-        for (const entry of updates) {
-            if (!entry) {
+        for (const contract of contracts) {
+            const market = normalizePredictionMarket(event, contract, now);
+            const textMatch = looksLikeCrypto15MinuteMarket(event, contract);
+
+            if (!textMatch && market.durationMinutes !== 15) {
                 continue;
             }
 
-            const side =
-                String(
-                    entry.side || ""
-                ).toLowerCase();
+            const candidate = {
+                ...market,
+                btc: true,
+                is15mText: textMatch
+            };
 
-            const price = safeNumber(
-                entry.price_level ??
-                entry.price ??
-                entry.px
-            );
-
-            const quantity = safeNumber(
-                entry.new_quantity ??
-                entry.quantity ??
-                entry.qty
-            );
-
-            if (price <= 0) {
+            if (!candidateIsUsable(candidate, now)) {
                 continue;
             }
 
-            const isBid =
-                side === "bid" ||
-                side === "buy";
-
-            const isAsk =
-                side === "ask" ||
-                side === "offer" ||
-                side === "sell";
-
-            if (!isBid && !isAsk) {
-                continue;
-            }
-
-            if (quantity <= 0) {
-                if (isBid) {
-                    book.bids.delete(price);
-                }
-
-                if (isAsk) {
-                    book.asks.delete(price);
-                }
-
-                continue;
-            }
-
-            if (isBid) {
-                book.bids.set(
-                    price,
-                    quantity
-                );
-            }
-
-            if (isAsk) {
-                book.asks.set(
-                    price,
-                    quantity
-                );
-            }
-        }
-
-        if (updates.length > 0) {
-            book.bookInitialized = true;
-            book.lastBookAt = now();
+            candidate.selectionScore = scoreCandidate(candidate, now);
+            candidates.push(candidate);
         }
     }
+
+    candidates.sort((a, b) => b.selectionScore - a.selectionScore);
+
+    return candidates[0] || null;
 }
 
-function scheduleCoinbaseReconnect() {
-    if (!state.running) {
-        return;
-    }
+async function fetchDcmInstruments() {
+    const response = await axios.get(
+        `${CONFIG.dcmBaseUrl}/public/get-instruments`,
+        {
+            params: {
+                inst_type: 'BINARY_OPTION',
+                limit: 1000
+            },
+            timeout: CONFIG.requestTimeoutMs,
+            headers: { Accept: 'application/json' }
+        }
+    );
 
-    if (coinbaseReconnectTimer) {
-        return;
-    }
-
-    coinbaseReconnectTimer = setTimeout(() => {
-        coinbaseReconnectTimer = null;
-
-        state.exchanges.coinbase.bids.clear();
-        state.exchanges.coinbase.asks.clear();
-
-        state.exchanges.coinbase.bookInitialized =
-            false;
-
-        connectCoinbase();
-    }, CONFIG.reconnectDelayMs);
+    return (
+        response.data?.result?.data ||
+        response.data?.result?.instruments ||
+        response.data?.data ||
+        []
+    );
 }
 
-// ============================================================
-// KRAKEN
-// ============================================================
+function dcmLooksLikeBtc(instrument) {
+    const values = [
+        instrument?.base_ccy,
+        instrument?.base_currency,
+        instrument?.underlying_symbol,
+        instrument?.symbol,
+        instrument?.display_name,
+        instrument?.event_symbol,
+        instrument?.event_details?.eventName,
+        instrument?.event_details?.metaData?.NAME,
+        instrument?.event_details?.metaData?.UNDERLYING
+    ].filter(Boolean);
 
-let krakenWs = null;
-let krakenReconnectTimer = null;
+    return values.some(isBtcText);
+}
 
-function connectKraken() {
-    if (!state.running) {
-        return;
-    }
+function dcmIsBinaryOption(instrument) {
+    const type = normalizeText(
+        instrument?.inst_type ||
+        instrument?.instrument_type ||
+        instrument?.security_sub_type ||
+        instrument?.event_details?.metaData?.PREDICT_CONTRACT_TYPE ||
+        ''
+    );
 
-    console.log("[Kraken] Connecting...");
+    return type === 'BINARY_OPTION' || type.includes('BINARY');
+}
 
+function normalizeDcmMarket(instrument, now = Date.now()) {
+    const { open, close } = extractOpenClose(instrument);
+    const strike = extractStrike(instrument);
+    const d = duration(open, close);
+
+    return {
+        available: true,
+        source: 'CRYPTO.COM_DCM',
+        eventId: instrument?.event_symbol || instrument?.event_id || null,
+        contractId: instrument?.symbol || null,
+        symbol: instrument?.symbol || null,
+        displayName: instrument?.display_name || null,
+        title: instrument?.display_name || null,
+        instrumentType: instrument?.inst_type || 'BINARY_OPTION',
+        underlying: instrument?.underlying_symbol || instrument?.base_ccy || 'BTC',
+        strike,
+        strikeAvailable: strike !== null,
+        strikeOperator: extractOperator(instrument),
+        strikeIndex: instrument?.attributes?.STRIKE_INDEX || instrument?.strike_index || null,
+        openTime: open != null ? new Date(open).toISOString() : null,
+        closeTime: close != null ? new Date(close).toISOString() : null,
+        openTimestampMs: open,
+        closeTimestampMs: close,
+        durationMs: d,
+        durationMinutes: d != null ? d / 60000 : null,
+        secondsRemaining: close != null
+            ? Math.max(0, Math.ceil((close - now) / 1000))
+            : null,
+        tradable: Boolean(instrument?.tradable),
+        status: instrument?.status || 'active',
+        metadata: instrument?.event_details?.metaData || {},
+        raw: instrument
+    };
+}
+
+async function pollDcmFallback() {
     try {
-        krakenWs = new WebSocket(
-            CONFIG.kraken.wsUrl
-        );
+        const instruments = await fetchDcmInstruments();
+        const now = Date.now();
 
-        krakenWs.on("open", () => {
-            console.log("[Kraken] Connected.");
+        state.instrumentsSeen = instruments.length;
+        state.btcBinaryInstrumentsSeen = instruments.filter(
+            instrument => dcmIsBinaryOption(instrument) && dcmLooksLikeBtc(instrument)
+        ).length;
 
-            state.exchanges.kraken.connected = true;
-            state.exchanges.kraken.lastMessageAt = now();
+        const candidates = instruments
+            .filter(instrument => {
+                if (!instrument?.tradable) return false;
+                if (!dcmIsBinaryOption(instrument)) return false;
+                if (!dcmLooksLikeBtc(instrument)) return false;
 
-            subscribeKraken();
+                const market = normalizeDcmMarket(instrument, now);
+
+                return (
+                    isCurrent15m(market.openTimestampMs, market.closeTimestampMs, now) &&
+                    market.strike !== null
+                );
+            })
+            .map(instrument => normalizeDcmMarket(instrument, now));
+
+        candidates.sort((a, b) => {
+            const ad = a.durationMs == null ? Infinity : Math.abs(a.durationMs - CONFIG.targetDurationMs);
+            const bd = b.durationMs == null ? Infinity : Math.abs(b.durationMs - CONFIG.targetDurationMs);
+            return ad - bd;
         });
 
-        krakenWs.on("message", raw => {
-            handleKrakenMessage(raw);
-        });
-
-        krakenWs.on("error", error => {
-            console.log(
-                "[Kraken] Error:",
-                error.message || error
-            );
-        });
-
-        krakenWs.on("close", () => {
-            state.exchanges.kraken.connected = false;
-
-            console.log("[Kraken] Disconnected.");
-
-            scheduleKrakenReconnect();
-        });
+        return candidates[0] || null;
     } catch (error) {
-        console.log(
-            "[Kraken] Connection error:",
-            error.message || error
-        );
-
-        scheduleKrakenReconnect();
+        return null;
     }
 }
 
-function subscribeKraken() {
-    if (
-        !krakenWs ||
-        krakenWs.readyState !== WebSocket.OPEN
-    ) {
-        return;
-    }
-
-    krakenWs.send(
-        JSON.stringify({
-            method: "subscribe",
-            params: {
-                channel: "book",
-                symbol: [
-                    CONFIG.kraken.symbol
-                ],
-                depth:
-                    CONFIG.krakenBookDepth,
-                snapshot: true
-            }
-        })
-    );
-
-    krakenWs.send(
-        JSON.stringify({
-            method: "subscribe",
-            params: {
-                channel: "ticker",
-                symbol: [
-                    CONFIG.kraken.symbol
-                ]
-            }
-        })
-    );
-
-    krakenWs.send(
-        JSON.stringify({
-            method: "subscribe",
-            params: {
-                channel: "trade",
-                symbol: [
-                    CONFIG.kraken.symbol
-                ]
-            }
-        })
-    );
-
-    krakenWs.send(
-        JSON.stringify({
-            method: "subscribe",
-            params: {
-                channel: "ohlc",
-                symbol: [
-                    CONFIG.kraken.symbol
-                ],
-                interval: 1
-            }
-        })
-    );
-}
-
-function handleKrakenMessage(raw) {
-    let message;
+async function poll() {
+    state.lastPollAt = new Date().toISOString();
+    state.contractsSeen = 0;
+    state.btcContractsSeen = 0;
 
     try {
-        message = JSON.parse(
-            raw.toString()
-        );
-    } catch {
-        return;
-    }
+        let market = null;
 
-    state.stats.messages.kraken++;
-
-    state.exchanges.kraken.lastMessageAt =
-        now();
-
-    if (message.method === "subscribe") {
-        if (message.success === false) {
-            console.log(
-                "[Kraken] Subscription failed:",
-                message.error ||
-                    "Unknown error"
-            );
+        try {
+            market = await pollPredictionApi();
+        } catch (error) {
+            state.lastError = {
+                source: 'PREDICTIONS_API',
+                message: error.message,
+                timestamp: new Date().toISOString()
+            };
         }
 
-        return;
-    }
-
-    if (
-        message.channel ===
-        "heartbeat"
-    ) {
-        return;
-    }
-
-    const channel = message.channel;
-
-    if (!channel) {
-        return;
-    }
-
-    // --------------------------------------------------------
-    // BOOK
-    // --------------------------------------------------------
-
-    if (channel === "book") {
-        handleKrakenBook(message);
-        return;
-    }
-
-    // --------------------------------------------------------
-    // TICKER
-    // --------------------------------------------------------
-
-    if (channel === "ticker") {
-        const data = Array.isArray(
-            message.data
-        )
-            ? message.data
-            : [];
-
-        for (const ticker of data) {
-            if (
-                ticker.symbol &&
-                ticker.symbol !==
-                    CONFIG.kraken.symbol
-            ) {
-                continue;
-            }
-
-            const price =
-                ticker.last ??
-                ticker.last_trade_price ??
-                ticker.price;
-
-            if (isFiniteNumber(price)) {
-                addPricePoint(
-                    Number(price),
-                    "kraken"
-                );
-
-                state.exchanges.kraken.lastPriceAt =
-                    now();
-            }
+        if (!market) {
+            market = await pollDcmFallback();
         }
 
-        return;
-    }
-
-    // --------------------------------------------------------
-    // TRADE
-    // --------------------------------------------------------
-
-    if (channel === "trade") {
-        const data = Array.isArray(
-            message.data
-        )
-            ? message.data
-            : [];
-
-        for (const trade of data) {
-            if (
-                trade.symbol &&
-                trade.symbol !==
-                    CONFIG.kraken.symbol
-            ) {
-                continue;
-            }
-
-            const price =
-                safeNumber(
-                    trade.price
-                );
-
-            const quantity =
-                safeNumber(
-                    trade.qty ??
-                    trade.quantity
-                );
-
-            let timestamp = now();
-
-            if (trade.timestamp) {
-                const parsed =
-                    Date.parse(
-                        trade.timestamp
-                    );
-
-                if (
-                    Number.isFinite(
-                        parsed
-                    )
-                ) {
-                    timestamp = parsed;
-                }
-            }
-
-            addTrade({
-                price,
-                quantity,
-                side:
-                    trade.side ||
-                    "unknown",
-                exchange: "kraken",
-                timestamp
-            });
-
-            if (price > 0) {
-                addPricePoint(
-                    price,
-                    "kraken-trade"
-                );
-            }
-        }
-    }
-}
-
-// ============================================================
-// KRAKEN ORDER BOOK
-// ============================================================
-
-function handleKrakenBook(message) {
-    const book =
-        state.exchanges.kraken;
-
-    if (
-        !Array.isArray(message.data) ||
-        !message.data[0]
-    ) {
-        return;
-    }
-
-    const payload =
-        message.data[0];
-
-    if (
-        payload.symbol &&
-        payload.symbol !==
-            CONFIG.kraken.symbol
-    ) {
-        return;
-    }
-
-    const bids =
-        Array.isArray(payload.bids)
-            ? payload.bids
-            : [];
-
-    const asks =
-        Array.isArray(payload.asks)
-            ? payload.asks
-            : [];
-
-    if (message.type === "snapshot") {
-        book.bids.clear();
-        book.asks.clear();
-
-        for (const level of bids) {
-            const price =
-                safeNumber(
-                    level.price
-                );
-
-            const quantity =
-                safeNumber(
-                    level.qty
-                );
-
-            if (
-                price > 0 &&
-                quantity > 0
-            ) {
-                book.bids.set(
-                    price,
-                    quantity
-                );
-            }
-        }
-
-        for (const level of asks) {
-            const price =
-                safeNumber(
-                    level.price
-                );
-
-            const quantity =
-                safeNumber(
-                    level.qty
-                );
-
-            if (
-                price > 0 &&
-                quantity > 0
-            ) {
-                book.asks.set(
-                    price,
-                    quantity
-                );
-            }
-        }
-
-        book.bookInitialized = true;
-        book.lastBookAt = now();
-
-        return;
-    }
-
-    if (message.type === "update") {
-        for (const level of bids) {
-            const price =
-                safeNumber(
-                    level.price
-                );
-
-            const quantity =
-                safeNumber(
-                    level.qty
-                );
-
-            if (price <= 0) {
-                continue;
-            }
-
-            if (quantity <= 0) {
-                book.bids.delete(
-                    price
-                );
-            } else {
-                book.bids.set(
-                    price,
-                    quantity
-                );
-            }
-        }
-
-        for (const level of asks) {
-            const price =
-                safeNumber(
-                    level.price
-                );
-
-            const quantity =
-                safeNumber(
-                    level.qty
-                );
-
-            if (price <= 0) {
-                continue;
-            }
-
-            if (quantity <= 0) {
-                book.asks.delete(
-                    price
-                );
-            } else {
-                book.asks.set(
-                    price,
-                    quantity
-                );
-            }
-        }
-
-        book.bookInitialized = true;
-        book.lastBookAt = now();
-    }
-}
-
-function scheduleKrakenReconnect() {
-    if (!state.running) {
-        return;
-    }
-
-    if (krakenReconnectTimer) {
-        return;
-    }
-
-    krakenReconnectTimer = setTimeout(() => {
-        krakenReconnectTimer = null;
-
-        state.exchanges.kraken.bids.clear();
-        state.exchanges.kraken.asks.clear();
-
-        state.exchanges.kraken.bookInitialized =
-            false;
-
-        connectKraken();
-    }, CONFIG.reconnectDelayMs);
-}
-
-// ============================================================
-// ORDER BOOK STATS
-// ============================================================
-
-function getBookStats(exchangeName) {
-    const exchange =
-        state.exchanges[
-            exchangeName
-        ];
-
-    if (!exchange) {
-        return {
-            bids: 0,
-            asks: 0,
-            bidQuantity: 0,
-            askQuantity: 0,
-            imbalance: 0,
-            bestBid: null,
-            bestAsk: null,
-            spread: null,
-            spreadPercent: null,
-            initialized: false,
-            lastBookAt: 0
-        };
-    }
-
-    const bids =
-        Array.from(
-            exchange.bids.entries()
-        );
-
-    const asks =
-        Array.from(
-            exchange.asks.entries()
-        );
-
-    bids.sort(
-        (a, b) =>
-            b[0] - a[0]
-    );
-
-    asks.sort(
-        (a, b) =>
-            a[0] - b[0]
-    );
-
-    const topBids =
-        bids.slice(0, 100);
-
-    const topAsks =
-        asks.slice(0, 100);
-
-    let bidQuantity = 0;
-    let askQuantity = 0;
-
-    for (const [, quantity] of topBids) {
-        bidQuantity +=
-            safeNumber(quantity);
-    }
-
-    for (const [, quantity] of topAsks) {
-        askQuantity +=
-            safeNumber(quantity);
-    }
-
-    const bestBid =
-        topBids.length > 0
-            ? topBids[0][0]
-            : null;
-
-    const bestAsk =
-        topAsks.length > 0
-            ? topAsks[0][0]
-            : null;
-
-    let spread = null;
-    let spreadPercent = null;
-
-    if (
-        bestBid !== null &&
-        bestAsk !== null &&
-        bestAsk >= bestBid
-    ) {
-        spread =
-            bestAsk -
-            bestBid;
-
-        const midpoint =
-            (bestAsk + bestBid) /
-            2;
-
-        if (midpoint > 0) {
-            spreadPercent =
-                (spread / midpoint) *
-                100;
-        }
-    }
-
-    const total =
-        bidQuantity +
-        askQuantity;
-
-    const imbalance =
-        total > 0
-            ? (
-                  bidQuantity -
-                  askQuantity
-              ) / total
-            : 0;
-
-    return {
-        bids: topBids.length,
-        asks: topAsks.length,
-
-        bidQuantity,
-
-        askQuantity,
-
-        imbalance,
-
-        bestBid,
-
-        bestAsk,
-
-        spread,
-
-        spreadPercent,
-
-        initialized:
-            exchange.bookInitialized,
-
-        lastBookAt:
-            exchange.lastBookAt
-    };
-}
-
-function getBookDepthStats(
-    exchangeName,
-    depth
-) {
-    const exchange =
-        state.exchanges[
-            exchangeName
-        ];
-
-    if (!exchange) {
-        return {
-            depth,
-            bidQuantity: 0,
-            askQuantity: 0,
-            imbalance: 0
-        };
-    }
-
-    const bids =
-        Array.from(
-            exchange.bids.entries()
-        ).sort(
-            (a, b) =>
-                b[0] - a[0]
-        );
-
-    const asks =
-        Array.from(
-            exchange.asks.entries()
-        ).sort(
-            (a, b) =>
-                a[0] - b[0]
-        );
-
-    const topBids =
-        bids.slice(0, depth);
-
-    const topAsks =
-        asks.slice(0, depth);
-
-    let bidQuantity = 0;
-    let askQuantity = 0;
-
-    for (const [, quantity] of topBids) {
-        bidQuantity +=
-            safeNumber(quantity);
-    }
-
-    for (const [, quantity] of topAsks) {
-        askQuantity +=
-            safeNumber(quantity);
-    }
-
-    const total =
-        bidQuantity +
-        askQuantity;
-
-    const imbalance =
-        total > 0
-            ? (
-                  bidQuantity -
-                  askQuantity
-              ) / total
-            : 0;
-
-    return {
-        depth,
-
-        bidQuantity,
-
-        askQuantity,
-
-        imbalance
-    };
-}
-
-function calculateCombinedBookStats() {
-    const coinbase =
-        getBookStats(
-            "coinbase"
-        );
-
-    const kraken =
-        getBookStats(
-            "kraken"
-        );
-
-    const bidQuantity =
-        coinbase.bidQuantity +
-        kraken.bidQuantity;
-
-    const askQuantity =
-        coinbase.askQuantity +
-        kraken.askQuantity;
-
-    const total =
-        bidQuantity +
-        askQuantity;
-
-    const imbalance =
-        total > 0
-            ? (
-                  bidQuantity -
-                  askQuantity
-              ) / total
-            : 0;
-
-    return {
-        coinbase,
-        kraken,
-
-        bidQuantity,
-
-        askQuantity,
-
-        imbalance
-    };
-}
-
-// ============================================================
-// TRADE STATS
-// ============================================================
-
-function getRecentTradeStats(
-    seconds = 60
-) {
-    const cutoff =
-        now() -
-        seconds * 1000;
-
-    const recent =
-        state.trades.filter(
-            trade =>
-                trade.timestamp >=
-                cutoff
-        );
-
-    let buyQuantity = 0;
-    let sellQuantity = 0;
-    let unknownQuantity = 0;
-    let totalQuantity = 0;
-
-    let buyCount = 0;
-    let sellCount = 0;
-    let unknownCount = 0;
-
-    for (const trade of recent) {
-        const quantity =
-            safeNumber(
-                trade.quantity
-            );
-
-        totalQuantity +=
-            quantity;
-
-        const side =
-            String(
-                trade.side || ""
-            ).toLowerCase();
-
-        if (side === "buy") {
-            buyQuantity +=
-                quantity;
-
-            buyCount++;
-        } else if (
-            side === "sell"
-        ) {
-            sellQuantity +=
-                quantity;
-
-            sellCount++;
+        state.activeMarket = market;
+        state.source = market?.source || null;
+        state.lastSuccessAt = new Date().toISOString();
+
+        if (market) {
+            state.lastError = null;
+
+            console.log('');
+            console.log('========== CRYPTO.COM MARKET =========');
+            console.log(`Source: ${market.source}`);
+            console.log(`Contract: ${market.symbol || market.contractId || 'UNKNOWN'}`);
+            console.log(`Title: ${market.title || market.displayName || 'UNKNOWN'}`);
+            console.log(`BTC Strike: ${market.strike !== null ? `$${market.strike.toFixed(2)}` : 'NOT EXPOSED BY FEED'}`);
+            console.log(`Operator: ${market.strikeOperator || 'UNKNOWN'}`);
+            console.log(`Open: ${market.openTime || 'UNKNOWN'}`);
+            console.log(`Close: ${market.closeTime || 'UNKNOWN'}`);
+            console.log(`Strike Available: ${market.strikeAvailable ? 'YES' : 'NO'}`);
+            console.log('========================================');
         } else {
-            unknownQuantity +=
-                quantity;
-
-            unknownCount++;
+            console.log('');
+            console.log('========== CRYPTO.COM MARKET =========');
+            console.log('Status: ACTIVE BTC 15-MINUTE CONTRACT NOT FOUND');
+            console.log(`Prediction events scanned: ${state.eventsSeen}`);
+            console.log(`BTC events found: ${state.btcEventsSeen}`);
+            console.log(`Contracts scanned: ${state.contractsSeen}`);
+            console.log('Decision: WAITING FOR AN ACTUAL CONTRACT + STRIKE');
+            console.log('========================================');
         }
-    }
-
-    const directionalTotal =
-        buyQuantity +
-        sellQuantity;
-
-    const tradeImbalance =
-        directionalTotal > 0
-            ? (
-                  buyQuantity -
-                  sellQuantity
-              ) /
-              directionalTotal
-            : 0;
-
-    const buyRatio =
-        directionalTotal > 0
-            ? buyQuantity /
-              directionalTotal
-            : null;
-
-    const sellRatio =
-        directionalTotal > 0
-            ? sellQuantity /
-              directionalTotal
-            : null;
-
-    return {
-        seconds,
-
-        count:
-            recent.length,
-
-        buyCount,
-
-        sellCount,
-
-        unknownCount,
-
-        buyQuantity,
-
-        sellQuantity,
-
-        unknownQuantity,
-
-        totalQuantity,
-
-        directionalQuantity:
-            directionalTotal,
-
-        buyRatio,
-
-        sellRatio,
-
-        imbalance:
-            tradeImbalance
-    };
-}
-
-// ============================================================
-// TRADE PRESSURE FEATURES
-// ============================================================
-
-function calculateTradeFeatures() {
-    const windows = {};
-
-    for (
-        const seconds of
-        CONFIG.featureWindows
-    ) {
-        const stats =
-            getRecentTradeStats(
-                seconds
-            );
-
-        windows[seconds] = {
-            count:
-                stats.count,
-
-            buyCount:
-                stats.buyCount,
-
-            sellCount:
-                stats.sellCount,
-
-            totalVolume:
-                stats.totalQuantity,
-
-            buyVolume:
-                stats.buyQuantity,
-
-            sellVolume:
-                stats.sellQuantity,
-
-            unknownVolume:
-                stats.unknownQuantity,
-
-            buyRatio:
-                stats.buyRatio,
-
-            sellRatio:
-                stats.sellRatio,
-
-            imbalance:
-                stats.imbalance
+    } catch (error) {
+        state.lastError = {
+            source: 'CRYPTO_COM_MARKET',
+            message: error.message,
+            timestamp: new Date().toISOString()
         };
-    }
 
-    return windows;
+        console.error('Crypto.com market-data error:', error.message);
+    }
 }
-
-// ============================================================
-// REALIZED VOLATILITY
-// ============================================================
-
-function getRealizedVolatility(
-    seconds = 60
-) {
-    const cutoff =
-        now() -
-        seconds * 1000;
-
-    const points =
-        state.priceHistory.filter(
-            point =>
-                point.timestamp >=
-                cutoff
-        );
-
-    if (points.length < 3) {
-        return null;
-    }
-
-    const returns = [];
-
-    for (
-        let i = 1;
-        i < points.length;
-        i++
-    ) {
-        const previous =
-            points[i - 1].price;
-
-        const current =
-            points[i].price;
-
-        if (
-            previous > 0 &&
-            current > 0
-        ) {
-            returns.push(
-                Math.log(
-                    current /
-                        previous
-                )
-            );
-        }
-    }
-
-    if (returns.length < 2) {
-        return null;
-    }
-
-    const mean =
-        returns.reduce(
-            (sum, value) =>
-                sum + value,
-            0
-        ) /
-        returns.length;
-
-    let variance = 0;
-
-    for (const value of returns) {
-        variance +=
-            Math.pow(
-                value - mean,
-                2
-            );
-    }
-
-    variance /=
-        returns.length - 1;
-
-    return Math.sqrt(
-        variance
-    );
-}
-
-// ============================================================
-// MOMENTUM FEATURES
-// ============================================================
-
-function calculateMomentumFeatures() {
-    const movements = {};
-
-    for (
-        const seconds of
-        CONFIG.priceWindows
-    ) {
-        movements[seconds] =
-            getPriceMovement(
-                seconds
-            );
-    }
-
-    const movement15 =
-        movements[15];
-
-    const movement30 =
-        movements[30];
-
-    const movement60 =
-        movements[60];
-
-    let acceleration15to30 = null;
-    let acceleration30to60 = null;
-
-    if (
-        movement15 !== null &&
-        movement30 !== null
-    ) {
-        acceleration15to30 =
-            movement15 -
-            movement30;
-    }
-
-    if (
-        movement30 !== null &&
-        movement60 !== null
-    ) {
-        acceleration30to60 =
-            movement30 -
-            movement60;
-    }
-
-    let shortTermAcceleration = null;
-
-    if (
-        acceleration15to30 !== null &&
-        acceleration30to60 !== null
-    ) {
-        shortTermAcceleration =
-            (
-                acceleration15to30 +
-                acceleration30to60
-            ) / 2;
-    } else if (
-        acceleration15to30 !== null
-    ) {
-        shortTermAcceleration =
-            acceleration15to30;
-    } else if (
-        acceleration30to60 !== null
-    ) {
-        shortTermAcceleration =
-            acceleration30to60;
-    }
-
-    return {
-        movement15s:
-            movement15,
-
-        movement30s:
-            movement30,
-
-        movement60s:
-            movement60,
-
-        movement180s:
-            movements[180],
-
-        movement300s:
-            movements[300],
-
-        acceleration15to30,
-
-        acceleration30to60,
-
-        shortTermAcceleration
-    };
-}
-
-// ============================================================
-// ORDER BOOK FEATURES
-// ============================================================
-
-function calculateOrderBookFeatures() {
-    const combined =
-        calculateCombinedBookStats();
-
-    const depth = {};
-
-    for (
-        const depthSize of
-        CONFIG.bookDepths
-    ) {
-        const coinbase =
-            getBookDepthStats(
-                "coinbase",
-                depthSize
-            );
-
-        const kraken =
-            getBookDepthStats(
-                "kraken",
-                depthSize
-            );
-
-        const bidQuantity =
-            coinbase.bidQuantity +
-            kraken.bidQuantity;
-
-        const askQuantity =
-            coinbase.askQuantity +
-            kraken.askQuantity;
-
-        const total =
-            bidQuantity +
-            askQuantity;
-
-        const imbalance =
-            total > 0
-                ? (
-                      bidQuantity -
-                      askQuantity
-                  ) / total
-                : 0;
-
-        depth[depthSize] = {
-            bidQuantity,
-
-            askQuantity,
-
-            imbalance
-        };
-    }
-
-    return {
-        combined: {
-            bidQuantity:
-                combined.bidQuantity,
-
-            askQuantity:
-                combined.askQuantity,
-
-            imbalance:
-                combined.imbalance
-        },
-
-        depths: depth,
-
-        coinbase: {
-            bids:
-                combined.coinbase.bids,
-
-            asks:
-                combined.coinbase.asks,
-
-            bestBid:
-                combined.coinbase.bestBid,
-
-            bestAsk:
-                combined.coinbase.bestAsk,
-
-            spread:
-                combined.coinbase.spread,
-
-            spreadPercent:
-                combined.coinbase.spreadPercent,
-
-            imbalance:
-                combined.coinbase.imbalance
-        },
-
-        kraken: {
-            bids:
-                combined.kraken.bids,
-
-            asks:
-                combined.kraken.asks,
-
-            bestBid:
-                combined.kraken.bestBid,
-
-            bestAsk:
-                combined.kraken.bestAsk,
-
-            spread:
-                combined.kraken.spread,
-
-            spreadPercent:
-                combined.kraken.spreadPercent,
-
-            imbalance:
-                combined.kraken.imbalance
-        }
-    };
-}
-
-// ============================================================
-// SPREAD FEATURES
-// ============================================================
-
-function calculateSpreadFeatures() {
-    const coinbase =
-        getBookStats(
-            "coinbase"
-        );
-
-    const kraken =
-        getBookStats(
-            "kraken"
-        );
-
-    const exchanges = {
-        coinbase: {
-            bestBid:
-                coinbase.bestBid,
-
-            bestAsk:
-                coinbase.bestAsk,
-
-            spread:
-                coinbase.spread,
-
-            spreadPercent:
-                coinbase.spreadPercent
-        },
-
-        kraken: {
-            bestBid:
-                kraken.bestBid,
-
-            bestAsk:
-                kraken.bestAsk,
-
-            spread:
-                kraken.spread,
-
-            spreadPercent:
-                kraken.spreadPercent
-        }
-    };
-
-    const validSpreads = [
-        coinbase.spreadPercent,
-        kraken.spreadPercent
-    ].filter(
-        value =>
-            Number.isFinite(value)
-    );
-
-    return {
-        exchanges,
-
-        averageSpreadPercent:
-            average(
-                validSpreads
-            )
-    };
-}
-
-// ============================================================
-// CROSS-EXCHANGE FEATURES
-// ============================================================
-
-function calculateCrossExchangeFeatures() {
-    const coinbase =
-        getLatestPriceForExchange(
-            "coinbase"
-        );
-
-    const kraken =
-        getLatestPriceForExchange(
-            "kraken"
-        );
-
-    if (
-        !coinbase ||
-        !kraken ||
-        coinbase.price <= 0 ||
-        kraken.price <= 0
-    ) {
-        return {
-            coinbasePrice:
-                coinbase
-                    ? coinbase.price
-                    : null,
-
-            krakenPrice:
-                kraken
-                    ? kraken.price
-                    : null,
-
-            priceDifference:
-                null,
-
-            priceDifferencePercent:
-                null,
-
-            midpoint:
-                null
-        };
-    }
-
-    const difference =
-        coinbase.price -
-        kraken.price;
-
-    const midpoint =
-        (
-            coinbase.price +
-            kraken.price
-        ) / 2;
-
-    const differencePercent =
-        midpoint > 0
-            ? (
-                  difference /
-                  midpoint
-              ) * 100
-            : null;
-
-    return {
-        coinbasePrice:
-            coinbase.price,
-
-        krakenPrice:
-            kraken.price,
-
-        priceDifference:
-            difference,
-
-        priceDifferencePercent:
-            differencePercent,
-
-        midpoint
-    };
-}
-
-// ============================================================
-// VOLATILITY FEATURES
-// ============================================================
-
-function calculateVolatilityFeatures() {
-    return {
-        realized15s:
-            getRealizedVolatility(
-                15
-            ),
-
-        realized30s:
-            getRealizedVolatility(
-                30
-            ),
-
-        realized60s:
-            getRealizedVolatility(
-                60
-            ),
-
-        realized180s:
-            getRealizedVolatility(
-                180
-            ),
-
-        realized300s:
-            getRealizedVolatility(
-                300
-            )
-    };
-}
-
-// ============================================================
-// EXCHANGE HEALTH
-// ============================================================
-
-function getExchangeHealth(
-    exchangeName
-) {
-    const exchange =
-        state.exchanges[
-            exchangeName
-        ];
-
-    const currentTime =
-        now();
-
-    const messageAge =
-        exchange.lastMessageAt > 0
-            ? currentTime -
-              exchange.lastMessageAt
-            : Infinity;
-
-    const priceAge =
-        exchange.lastPriceAt > 0
-            ? currentTime -
-              exchange.lastPriceAt
-            : Infinity;
-
-    const bookAge =
-        exchange.lastBookAt > 0
-            ? currentTime -
-              exchange.lastBookAt
-            : Infinity;
-
-    return {
-        connected:
-            exchange.connected,
-
-        messageAge,
-
-        priceAge,
-
-        bookAge,
-
-        bookInitialized:
-            exchange.bookInitialized
-    };
-}
-
-// ============================================================
-// DATA QUALITY
-// ============================================================
-
-function calculateDataQuality() {
-    let score = 0;
-
-    const coinbase =
-        state.exchanges.coinbase;
-
-    const kraken =
-        state.exchanges.kraken;
-
-    if (coinbase.connected) {
-        score += 20;
-    }
-
-    if (kraken.connected) {
-        score += 20;
-    }
-
-    if (
-        coinbase.lastPriceAt > 0 &&
-        now() -
-            coinbase.lastPriceAt <
-            5000
-    ) {
-        score += 10;
-    }
-
-    if (
-        kraken.lastPriceAt > 0 &&
-        now() -
-            kraken.lastPriceAt <
-            5000
-    ) {
-        score += 10;
-    }
-
-    const coinbaseBook =
-        getBookStats(
-            "coinbase"
-        );
-
-    if (
-        coinbaseBook.initialized &&
-        coinbaseBook.bids > 0 &&
-        coinbaseBook.asks > 0 &&
-        now() -
-            coinbaseBook.lastBookAt <
-            10000
-    ) {
-        score += 10;
-    }
-
-    const krakenBook =
-        getBookStats(
-            "kraken"
-        );
-
-    if (
-        krakenBook.initialized &&
-        krakenBook.bids > 0 &&
-        krakenBook.asks > 0 &&
-        now() -
-            krakenBook.lastBookAt <
-            10000
-    ) {
-        score += 10;
-    }
-
-    if (state.trades.length > 0) {
-        const latestTrade =
-            state.trades[
-                state.trades.length - 1
-            ];
-
-        if (
-            latestTrade &&
-            now() -
-                latestTrade.timestamp <
-                10000
-        ) {
-            score += 10;
-        }
-    }
-
-    return clamp(
-        score,
-        0,
-        100
-    );
-}
-
-// ============================================================
-// FEATURE QUALITY
-// ============================================================
-
-function calculateFeatureQuality() {
-    let score = 0;
-
-    const dataQuality =
-        calculateDataQuality();
-
-    // Raw data quality contributes 50%.
-    score +=
-        dataQuality * 0.5;
-
-    // Price history available.
-    if (
-        state.priceHistory.length >=
-        20
-    ) {
-        score += 10;
-    }
-
-    // Enough history for 60-second calculations.
-    if (
-        state.priceHistory.length >=
-        60
-    ) {
-        score += 10;
-    }
-
-    // Recent trades available.
-    const recentTrades =
-        getRecentTradeStats(
-            60
-        );
-
-    if (
-        recentTrades.count >=
-        20
-    ) {
-        score += 10;
-    }
-
-    // Both order books available.
-    const book =
-        calculateCombinedBookStats();
-
-    if (
-        book.coinbase.bids > 0 &&
-        book.coinbase.asks > 0
-    ) {
-        score += 5;
-    }
-
-    if (
-        book.kraken.bids > 0 &&
-        book.kraken.asks > 0
-    ) {
-        score += 5;
-    }
-
-    // Both exchange prices available.
-    const cross =
-        calculateCrossExchangeFeatures();
-
-    if (
-        cross.coinbasePrice !== null &&
-        cross.krakenPrice !== null
-    ) {
-        score += 5;
-    }
-
-    return clamp(
-        Math.round(score),
-        0,
-        100
-    );
-}
-
-// ============================================================
-// COMPLETE FEATURE SNAPSHOT
-// ============================================================
-
-function getFeatureSnapshot() {
-    const momentum =
-        calculateMomentumFeatures();
-
-    const orderBook =
-        calculateOrderBookFeatures();
-
-    const tradePressure =
-        calculateTradeFeatures();
-
-    const volatility =
-        calculateVolatilityFeatures();
-
-    const spread =
-        calculateSpreadFeatures();
-
-    const crossExchange =
-        calculateCrossExchangeFeatures();
-
-    return {
-        timestamp:
-            now(),
-
-        price:
-            state.price,
-
-        momentum,
-
-        orderBook,
-
-        tradePressure,
-
-        volatility,
-
-        spread,
-
-        crossExchange,
-
-        quality: {
-            data:
-                calculateDataQuality(),
-
-            features:
-                calculateFeatureQuality()
-        }
-    };
-}
-
-// ============================================================
-// MARKET SNAPSHOT
-// ============================================================
-
-function getMarketSnapshot() {
-    const book =
-        calculateCombinedBookStats();
-
-    const movements = {};
-
-    for (
-        const seconds of
-        CONFIG.priceWindows
-    ) {
-        movements[seconds] =
-            getPriceMovement(
-                seconds
-            );
-    }
-
-    const tradeStats60 =
-        getRecentTradeStats(
-            60
-        );
-
-    const features =
-        getFeatureSnapshot();
-
-    return {
-        timestamp:
-            now(),
-
-        price:
-            state.price,
-
-        priceSource:
-            state.lastPriceSource,
-
-        movements,
-
-        orderBook: {
-            coinbase:
-                book.coinbase,
-
-            kraken:
-                book.kraken,
-
-            combined: {
-                bidQuantity:
-                    book.bidQuantity,
-
-                askQuantity:
-                    book.askQuantity,
-
-                imbalance:
-                    book.imbalance
-            }
-        },
-
-        trades: {
-            stored:
-                state.trades.length,
-
-            recent60s:
-                tradeStats60
-        },
-
-        volatility: {
-            realized15s:
-                getRealizedVolatility(
-                    15
-                ),
-
-            realized30s:
-                getRealizedVolatility(
-                    30
-                ),
-
-            realized60s:
-                getRealizedVolatility(
-                    60
-                ),
-
-            realized180s:
-                getRealizedVolatility(
-                    180
-                ),
-
-            realized300s:
-                getRealizedVolatility(
-                    300
-                )
-        },
-
-        health: {
-            coinbase:
-                getExchangeHealth(
-                    "coinbase"
-                ),
-
-            kraken:
-                getExchangeHealth(
-                    "kraken"
-                )
-        },
-
-        dataQuality:
-            calculateDataQuality(),
-
-        features
-    };
-}
-
-// ============================================================
-// REPORTING
-// ============================================================
-
-function formatMovement(
-    value
-) {
-    if (
-        value === null ||
-        !Number.isFinite(value)
-    ) {
-        return "COLLECTING";
-    }
-
-    return `${value.toFixed(4)}%`;
-}
-
-function formatNumber(
-    value,
-    decimals = 6
-) {
-    if (
-        value === null ||
-        !Number.isFinite(value)
-    ) {
-        return "COLLECTING";
-    }
-
-    return value.toFixed(
-        decimals
-    );
-}
-
-function printReport() {
-    const snapshot =
-        getMarketSnapshot();
-
-    const book =
-        snapshot.orderBook;
-
-    const features =
-        snapshot.features;
-
-    console.log("");
-
-    console.log(
-        "========== ZEUS MARKET DATA + FEATURES =========="
-    );
-
-    if (
-        snapshot.price !== null
-    ) {
-        console.log(
-            `BTC: $${snapshot.price.toFixed(
-                2
-            )}`
-        );
-    } else {
-        console.log(
-            "BTC: WAITING"
-        );
-    }
-
-    console.log(
-        `Data Quality: ${snapshot.dataQuality}%`
-    );
-
-    console.log(
-        `Feature Quality: ${features.quality.features}%`
-    );
-
-    console.log(
-        `Coinbase: ${
-            snapshot.health.coinbase.connected
-                ? "CONNECTED"
-                : "DISCONNECTED"
-        }`
-    );
-
-    console.log(
-        `Kraken: ${
-            snapshot.health.kraken.connected
-                ? "CONNECTED"
-                : "DISCONNECTED"
-        }`
-    );
-
-    // --------------------------------------------------------
-    // ORDER BOOK
-    // --------------------------------------------------------
-
-    console.log("");
-
-    console.log(
-        "----- ORDER BOOK -----"
-    );
-
-    console.log(
-        `Coinbase Book: ${
-            book.coinbase.bids
-        } bids / ${
-            book.coinbase.asks
-        } asks`
-    );
-
-    console.log(
-        `Kraken Book: ${
-            book.kraken.bids
-        } bids / ${
-            book.kraken.asks
-        } asks`
-    );
-
-    console.log(
-        `Combined Bid Quantity: ${
-            book.combined.bidQuantity.toFixed(
-                4
-            )
-        }`
-    );
-
-    console.log(
-        `Combined Ask Quantity: ${
-            book.combined.askQuantity.toFixed(
-                4
-            )
-        }`
-    );
-
-    console.log(
-        `Order Book Imbalance: ${
-            book.combined.imbalance.toFixed(
-                4
-            )
-        }`
-    );
-
-    console.log(
-        `5-Level Imbalance: ${
-            formatNumber(
-                features.orderBook.depths[5]
-                    .imbalance,
-                4
-            )
-        }`
-    );
-
-    console.log(
-        `10-Level Imbalance: ${
-            formatNumber(
-                features.orderBook.depths[10]
-                    .imbalance,
-                4
-            )
-        }`
-    );
-
-    console.log(
-        `25-Level Imbalance: ${
-            formatNumber(
-                features.orderBook.depths[25]
-                    .imbalance,
-                4
-            )
-        }`
-    );
-
-    // --------------------------------------------------------
-    // MOMENTUM
-    // --------------------------------------------------------
-
-    console.log("");
-
-    console.log(
-        "----- MOMENTUM -----"
-    );
-
-    console.log(
-        `15s Movement: ${
-            formatMovement(
-                features.momentum
-                    .movement15s
-            )
-        }`
-    );
-
-    console.log(
-        `30s Movement: ${
-            formatMovement(
-                features.momentum
-                    .movement30s
-            )
-        }`
-    );
-
-    console.log(
-        `60s Movement: ${
-            formatMovement(
-                features.momentum
-                    .movement60s
-            )
-        }`
-    );
-
-    console.log(
-        `180s Movement: ${
-            formatMovement(
-                features.momentum
-                    .movement180s
-            )
-        }`
-    );
-
-    console.log(
-        `300s Movement: ${
-            formatMovement(
-                features.momentum
-                    .movement300s
-            )
-        }`
-    );
-
-    console.log(
-        `Short-Term Acceleration: ${
-            formatMovement(
-                features.momentum
-                    .shortTermAcceleration
-            )
-        }`
-    );
-
-    // --------------------------------------------------------
-    // TRADE PRESSURE
-    // --------------------------------------------------------
-
-    console.log("");
-
-    console.log(
-        "----- TRADE PRESSURE -----"
-    );
-
-    const pressure60 =
-        features.tradePressure[60];
-
-    console.log(
-        `60s Buy Volume: ${
-            formatNumber(
-                pressure60.buyVolume,
-                4
-            )
-        }`
-    );
-
-    console.log(
-        `60s Sell Volume: ${
-            formatNumber(
-                pressure60.sellVolume,
-                4
-            )
-        }`
-    );
-
-    console.log(
-        `60s Trade Imbalance: ${
-            formatNumber(
-                pressure60.imbalance,
-                4
-            )
-        }`
-    );
-
-    console.log(
-        `60s Trade Count: ${
-            pressure60.count
-        }`
-    );
-
-    console.log(
-        `60s Total Volume: ${
-            formatNumber(
-                pressure60.totalVolume,
-                4
-            )
-        }`
-    );
-
-    // --------------------------------------------------------
-    // VOLATILITY
-    // --------------------------------------------------------
-
-    console.log("");
-
-    console.log(
-        "----- VOLATILITY -----"
-    );
-
-    console.log(
-        `15s Realized Volatility: ${
-            formatNumber(
-                features.volatility
-                    .realized15s,
-                8
-            )
-        }`
-    );
-
-    console.log(
-        `30s Realized Volatility: ${
-            formatNumber(
-                features.volatility
-                    .realized30s,
-                8
-            )
-        }`
-    );
-
-    console.log(
-        `60s Realized Volatility: ${
-            formatNumber(
-                features.volatility
-                    .realized60s,
-                8
-            )
-        }`
-    );
-
-    // --------------------------------------------------------
-    // SPREAD
-    // --------------------------------------------------------
-
-    console.log("");
-
-    console.log(
-        "----- MARKET MICROSTRUCTURE -----"
-    );
-
-    console.log(
-        `Coinbase Spread: ${
-            formatNumber(
-                features.spread.exchanges
-                    .coinbase.spread,
-                2
-            )
-        }`
-    );
-
-    console.log(
-        `Kraken Spread: ${
-            formatNumber(
-                features.spread.exchanges
-                    .kraken.spread,
-                2
-            )
-        }`
-    );
-
-    console.log(
-        `Average Spread %: ${
-            formatNumber(
-                features.spread
-                    .averageSpreadPercent,
-                6
-            )
-        }%`
-    );
-
-    console.log(
-        `Coinbase/Kraken Difference: ${
-            formatNumber(
-                features.crossExchange
-                    .priceDifference,
-                2
-            )
-        }`
-    );
-
-    console.log(
-        `Cross-Exchange Difference %: ${
-            formatNumber(
-                features.crossExchange
-                    .priceDifferencePercent,
-                6
-            )
-        }%`
-    );
-
-    console.log(
-        `Trades Stored: ${
-            snapshot.trades.stored
-        }`
-    );
-
-    console.log(
-        "=================================================="
-    );
-}
-
-// ============================================================
-// START / STOP
-// ============================================================
-
-let reportTimer = null;
 
 function start() {
-    console.log(
-        "=================================================="
-    );
+    if (state.running) return;
 
-    console.log(
-        "       ZEUS MARKET DATA + FEATURES STARTING"
-    );
+    state.running = true;
 
-    console.log(
-        "=================================================="
-    );
+    console.log('Crypto.com 15-minute market feed starting...');
+    console.log(`Predictions API: ${CONFIG.predictionsBaseUrl}`);
+    console.log(`DCM fallback: ${CONFIG.dcmBaseUrl}/public/get-instruments`);
+    console.log('Mode: READ-ONLY / PAPER');
 
-    console.log(
-        `Product: ${CONFIG.coinbase.productId}`
-    );
-
-    console.log(
-        "Feeds: Coinbase + Kraken"
-    );
-
-    console.log(
-        "Order books: SEPARATED BY EXCHANGE"
-    );
-
-    console.log(
-        "Feature layer: ENABLED"
-    );
-
-    console.log(
-        "Prediction engine: NOT ENABLED"
-    );
-
-    console.log(
-        "=================================================="
-    );
-
-    connectCoinbase();
-    connectKraken();
-
-    reportTimer =
-        setInterval(
-            printReport,
-            CONFIG.reportIntervalMs
-        );
+    poll();
+    timer = setInterval(poll, CONFIG.pollIntervalMs);
 }
 
 function stop() {
-    if (!state.running) {
-        return;
-    }
-
     state.running = false;
 
-    console.log("");
-
-    console.log(
-        "Stopping Zeus market data..."
-    );
-
-    if (reportTimer) {
-        clearInterval(
-            reportTimer
-        );
-
-        reportTimer = null;
-    }
-
-    if (coinbaseReconnectTimer) {
-        clearTimeout(
-            coinbaseReconnectTimer
-        );
-
-        coinbaseReconnectTimer =
-            null;
-    }
-
-    if (krakenReconnectTimer) {
-        clearTimeout(
-            krakenReconnectTimer
-        );
-
-        krakenReconnectTimer =
-            null;
-    }
-
-    if (coinbaseWs) {
-        try {
-            coinbaseWs.close();
-        } catch {}
-    }
-
-    if (krakenWs) {
-        try {
-            krakenWs.close();
-        } catch {}
+    if (timer) {
+        clearInterval(timer);
+        timer = null;
     }
 }
 
-// ============================================================
-// PROCESS SIGNALS
-// ============================================================
+function getMarket() {
+    return state.activeMarket;
+}
 
-process.on(
-    "SIGINT",
-    () => {
-        stop();
-
-        setTimeout(() => {
-            process.exit(0);
-        }, 250);
-    }
-);
-
-process.on(
-    "SIGTERM",
-    () => {
-        stop();
-
-        setTimeout(() => {
-            process.exit(0);
-        }, 250);
-    }
-);
-
-// ============================================================
-// EXPORTS
-// ============================================================
+function getStatus() {
+    return {
+        connected: Boolean(state.lastSuccessAt),
+        running: state.running,
+        lastPollAt: state.lastPollAt,
+        lastSuccessAt: state.lastSuccessAt,
+        lastError: state.lastError,
+        source: state.source,
+        eventsSeen: state.eventsSeen,
+        contractsSeen: state.contractsSeen,
+        btcEventsSeen: state.btcEventsSeen,
+        btcContractsSeen: state.btcContractsSeen,
+        instrumentsSeen: state.instrumentsSeen,
+        btcBinaryInstrumentsSeen: state.btcBinaryInstrumentsSeen,
+        market: state.activeMarket
+    };
+}
 
 module.exports = {
+    CONFIG,
+    state,
     start,
     stop,
-
-    getMarketSnapshot,
-    getFeatureSnapshot,
-
-    getBookStats,
-    getBookDepthStats,
-    calculateCombinedBookStats,
-    calculateOrderBookFeatures,
-
-    getRecentTradeStats,
-    calculateTradeFeatures,
-
-    getRealizedVolatility,
-    calculateVolatilityFeatures,
-
-    getPriceMovement,
-    calculateMomentumFeatures,
-
-    calculateSpreadFeatures,
-    calculateCrossExchangeFeatures,
-
-    calculateDataQuality,
-    calculateFeatureQuality,
-
-    state
+    poll,
+    getMarket,
+    getStatus
 };
-
-// ============================================================
-// RUN DIRECTLY
-// ============================================================
-
-if (
-    require.main === module
-) {
-    start();
-}
