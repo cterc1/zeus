@@ -752,26 +752,30 @@ async function pollPredictionApi() {
 
 async function fetchDcmInstruments() {
     /*
-     * Targeted DCM fallback.
+     * DCM fallback, optimized for the live BTC intraday contract.
      *
-     * Crypto.com's current DCM documentation supports filtering instruments by
-     * event_symbols. Pulling the complete binary-option catalog from since=0
-     * can be very large and was timing out on Render. We first ask DCM for
-     * events near the current time, keep only BTC events, then request
-     * instruments for those event symbols in batches of 10.
+     * First query recently updated BINARY_OPTION instruments directly. This
+     * avoids crawling the much larger all-event catalog just to discover a
+     * short-lived BTC contract. If that direct lookup cannot produce any
+     * instruments, fall back to the event -> event_symbols lookup.
+     *
+     * DCM page requests get one retry because Render occasionally sees an
+     * individual Crypto.com reference-data page exceed the normal timeout.
      */
     const instruments = [];
     const pages = [];
     const eventPages = [];
     const now = Date.now();
-    const eventWindowMs = 6 * 60 * 60 * 1000;
-    const lowerEventNs = Math.floor((now - eventWindowMs) * 1e6);
-    const upperEventNs = Math.floor((now + eventWindowMs) * 1e6);
+    const dcmTimeoutMs = Math.max(CONFIG.requestTimeoutMs, 20000);
+    const recentLookbackMs = 48 * 60 * 60 * 1000;
+    const recentSinceNs = Math.floor((now - recentLookbackMs) * 1e6);
 
     state.dcmHttpDiagnostics = {
-        strategy: 'BTC_EVENT_FILTERED_INSTRUMENT_LOOKUP',
+        strategy: 'RECENT_BINARY_INSTRUMENTS_THEN_BTC_EVENT_FALLBACK',
         eventsEndpoint: `${CONFIG.dcmBaseUrl}/public/get-events`,
         endpoint: `${CONFIG.dcmBaseUrl}/public/get-instruments`,
+        recentSinceNs,
+        recentPages: [],
         eventPages: [],
         btcEventSymbols: [],
         pages: [],
@@ -779,7 +783,116 @@ async function fetchDcmInstruments() {
         error: null
     };
 
+    async function getWithRetry(url, params, label) {
+        let lastError = null;
+
+        for (let attempt = 1; attempt <= 2; attempt += 1) {
+            try {
+                const response = await axios.get(url, {
+                    params,
+                    timeout: dcmTimeoutMs,
+                    headers: {
+                        Accept: 'application/json',
+                        'Content-Type': 'application/json'
+                    }
+                });
+
+                return { response, attempt };
+            } catch (error) {
+                lastError = error;
+                const retryable =
+                    error?.code === 'ECONNABORTED' ||
+                    /timeout/i.test(String(error?.message || '')) ||
+                    Number(error?.response?.status) >= 500;
+
+                if (!retryable || attempt >= 2) {
+                    error.dcmLabel = label;
+                    error.dcmAttempt = attempt;
+                    throw error;
+                }
+            }
+        }
+
+        throw lastError;
+    }
+
     try {
+        // Fast path: ask only for recently updated binary-option instruments.
+        // A live 15-minute BTC contract is short-lived, so this is far smaller
+        // than requesting the complete DCM instrument history with since=0.
+        const recentPages = [];
+        const seenRecentCursors = new Set();
+        let recentCursor = null;
+        let recentPage = 0;
+        const maxRecentPages = 10;
+
+        do {
+            const params = {
+                inst_type: 'BINARY_OPTION',
+                since: recentSinceNs,
+                limit: 1000
+            };
+
+            if (recentCursor) {
+                params.cursor = recentCursor;
+            }
+
+            const { response, attempt } = await getWithRetry(
+                `${CONFIG.dcmBaseUrl}/public/get-instruments`,
+                params,
+                `recent-instruments-page-${recentPage + 1}`
+            );
+
+            const body = response.data;
+            const result = body?.result || {};
+            const pageData = Array.isArray(result.data) ? result.data : [];
+            const nextCursor = result?.next_cursor || null;
+
+            recentPages.push({
+                page: recentPage + 1,
+                attempt,
+                httpStatus: response.status,
+                responseCode: body?.code ?? null,
+                responseMessage: body?.message ?? null,
+                pageInstrumentCount: pageData.length,
+                btcBinaryCount: pageData.filter(
+                    instrument => dcmIsBinaryOption(instrument) && dcmLooksLikeBtc(instrument)
+                ).length,
+                nextCursor: nextCursor ? String(nextCursor) : null
+            });
+
+            instruments.push(...pageData);
+            recentPage += 1;
+
+            if (!nextCursor || seenRecentCursors.has(String(nextCursor))) {
+                recentCursor = null;
+            } else {
+                seenRecentCursors.add(String(nextCursor));
+                recentCursor = nextCursor;
+            }
+        } while (recentCursor && recentPage < maxRecentPages);
+
+        state.dcmHttpDiagnostics.recentPages = recentPages;
+
+        // If the recent binary feed returned data, let the existing strict BTC,
+        // 15-minute, tradable and strike filters decide whether it is usable.
+        if (instruments.length) {
+            state.dcmHttpDiagnostics = {
+                ...state.dcmHttpDiagnostics,
+                recentPages,
+                eventPages,
+                btcEventSymbols: [],
+                pages,
+                totalInstruments: instruments.length,
+                error: null
+            };
+            return instruments;
+        }
+
+        // Secondary path: discover BTC events and fetch their instruments.
+        const eventWindowMs = 6 * 60 * 60 * 1000;
+        const lowerEventNs = Math.floor((now - eventWindowMs) * 1e6);
+        const upperEventNs = Math.floor((now + eventWindowMs) * 1e6);
         const btcEventSymbolSet = new Set();
         const seenEventCursors = new Set();
         let eventCursor = null;
@@ -797,23 +910,15 @@ async function fetchDcmInstruments() {
                 eventParams.cursor = eventCursor;
             }
 
-            const eventResponse = await axios.get(
+            const { response: eventResponse, attempt } = await getWithRetry(
                 `${CONFIG.dcmBaseUrl}/public/get-events`,
-                {
-                    params: eventParams,
-                    timeout: CONFIG.requestTimeoutMs,
-                    headers: {
-                        Accept: 'application/json',
-                        'Content-Type': 'application/json'
-                    }
-                }
+                eventParams,
+                `events-page-${eventPage + 1}`
             );
 
             const eventBody = eventResponse.data;
             const eventResult = eventBody?.result || {};
-            const events = Array.isArray(eventResult.data)
-                ? eventResult.data
-                : [];
+            const events = Array.isArray(eventResult.data) ? eventResult.data : [];
 
             const pageBtcEventSymbols = [...new Set(
                 events
@@ -842,6 +947,7 @@ async function fetchDcmInstruments() {
 
             eventPages.push({
                 page: eventPage + 1,
+                attempt,
                 httpStatus: eventResponse.status,
                 responseCode: eventBody?.code ?? null,
                 responseMessage: eventBody?.message ?? null,
@@ -870,13 +976,14 @@ async function fetchDcmInstruments() {
         if (!btcEventSymbols.length) {
             state.dcmHttpDiagnostics = {
                 ...state.dcmHttpDiagnostics,
+                recentPages,
                 eventPages,
                 btcEventSymbols,
                 pages,
-                totalInstruments: 0,
+                totalInstruments: instruments.length,
                 error: null
             };
-            return [];
+            return instruments;
         }
 
         for (let offset = 0; offset < btcEventSymbols.length; offset += 10) {
@@ -897,28 +1004,21 @@ async function fetchDcmInstruments() {
                     params.cursor = cursor;
                 }
 
-                const response = await axios.get(
+                const { response, attempt } = await getWithRetry(
                     `${CONFIG.dcmBaseUrl}/public/get-instruments`,
-                    {
-                        params,
-                        timeout: CONFIG.requestTimeoutMs,
-                        headers: {
-                            Accept: 'application/json',
-                            'Content-Type': 'application/json'
-                        }
-                    }
+                    params,
+                    `event-instruments-page-${page + 1}`
                 );
 
                 const body = response.data;
                 const result = body?.result || {};
-                const pageData = Array.isArray(result.data)
-                    ? result.data
-                    : [];
+                const pageData = Array.isArray(result.data) ? result.data : [];
                 const nextCursor = result?.next_cursor || null;
 
                 pages.push({
                     batch: batch.join(','),
                     page: page + 1,
+                    attempt,
                     httpStatus: response.status,
                     responseCode: body?.code ?? null,
                     responseMessage: body?.message ?? null,
@@ -940,6 +1040,7 @@ async function fetchDcmInstruments() {
 
         state.dcmHttpDiagnostics = {
             ...state.dcmHttpDiagnostics,
+            recentPages,
             eventPages,
             btcEventSymbols,
             pages,
@@ -968,6 +1069,8 @@ async function fetchDcmInstruments() {
             totalInstruments: instruments.length,
             error: {
                 message: error.message,
+                label: error?.dcmLabel || null,
+                attempt: error?.dcmAttempt || null,
                 requestUrl: error?.config?.url || null,
                 requestParams: error?.config?.params || null,
                 httpStatus: error?.response?.status ?? null,
