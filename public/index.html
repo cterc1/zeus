@@ -2423,11 +2423,20 @@
                 cryptoStatus.market ||
                 null;
 
-            currentCryptoMarket = {
-                ...(currentCryptoMarket || {}),
-                ...(nestedMarket || {}),
-                ...cryptoStatus
-            };
+            if (
+                !nestedMarket &&
+                cryptoStatus.active === false
+            ) {
+
+                showWaitingForCryptoContract();
+
+            } else {
+
+                currentCryptoMarket = {
+                    ...(nestedMarket || {}),
+                    ...cryptoStatus
+                };
+            }
 
 
             const cryptoTimes =
@@ -2455,6 +2464,55 @@
     }
 
 
+    function showWaitingForCryptoContract() {
+
+        currentCryptoMarket =
+            null;
+
+        currentRound =
+            null;
+
+        setText(
+            "cryptoMarketStatus",
+            "WAITING"
+        );
+
+        setText("cryptoContract", "--");
+        setText("cryptoStrike", "--");
+        setText("cryptoOperator", "--");
+        setText("cryptoDistance", "--");
+        setText("cryptoOpen", "--");
+        setText("cryptoClose", "--");
+        setText("cryptoRemaining", "--");
+
+        setText("roundStart", "Start: --");
+        setText("roundEnd", "End: --");
+        setText("roundCountdown", "WAITING FOR NEXT CONTRACT");
+
+        const progressBar =
+            byId("roundProgress");
+
+        if (progressBar) {
+            progressBar.style.width =
+                "0%";
+        }
+
+        const roundStatus =
+            byId("roundStatus");
+
+        if (roundStatus) {
+            roundStatus.classList.remove(
+                "complete"
+            );
+            roundStatus.classList.add(
+                "observing"
+            );
+            roundStatus.textContent =
+                "WAITING FOR CONTRACT";
+        }
+    }
+
+
     async function loadCryptoMarket() {
 
         const response =
@@ -2469,21 +2527,19 @@
 
 
         /*
-         * IMPORTANT:
-         *
-         * Do NOT replace currentCryptoMarket with null.
-         *
-         * Crypto.com can briefly return an empty market
-         * while rotating from one 15-minute contract to the
-         * next. The last valid contract must remain visible.
+         * Never keep an expired contract painted as ACTIVE.
+         * The backend intentionally returns market=null while it is
+         * waiting for Crypto.com to publish the next real contract.
          */
-
         if (apiMarket) {
 
             currentCryptoMarket = {
-                ...(currentCryptoMarket || {}),
                 ...apiMarket
             };
+
+        } else {
+
+            showWaitingForCryptoContract();
         }
 
 
@@ -2728,9 +2784,19 @@
 
             if (response) {
 
-                updateRoundFromBackend(
-                    response
-                );
+                if (
+                    response.active === false &&
+                    !response.contract
+                ) {
+
+                    showWaitingForCryptoContract();
+
+                } else {
+
+                    updateRoundFromBackend(
+                        response
+                    );
+                }
             }
 
         }
