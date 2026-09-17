@@ -780,55 +780,92 @@ async function fetchDcmInstruments() {
     };
 
     try {
-        const eventResponse = await axios.get(
-            `${CONFIG.dcmBaseUrl}/public/get-events`,
-            {
-                params: {
-                    limit: 100,
-                    event_date: lowerEventNs,
-                    event_end_date: upperEventNs
-                },
-                timeout: CONFIG.requestTimeoutMs,
-                headers: {
-                    Accept: 'application/json',
-                    'Content-Type': 'application/json'
-                }
+        const btcEventSymbolSet = new Set();
+        const seenEventCursors = new Set();
+        let eventCursor = null;
+        let eventPage = 0;
+        const maxEventPages = 20;
+
+        do {
+            const eventParams = {
+                limit: 100,
+                event_date: lowerEventNs,
+                event_end_date: upperEventNs
+            };
+
+            if (eventCursor) {
+                eventParams.cursor = eventCursor;
             }
+
+            const eventResponse = await axios.get(
+                `${CONFIG.dcmBaseUrl}/public/get-events`,
+                {
+                    params: eventParams,
+                    timeout: CONFIG.requestTimeoutMs,
+                    headers: {
+                        Accept: 'application/json',
+                        'Content-Type': 'application/json'
+                    }
+                }
+            );
+
+            const eventBody = eventResponse.data;
+            const eventResult = eventBody?.result || {};
+            const events = Array.isArray(eventResult.data)
+                ? eventResult.data
+                : [];
+
+            const pageBtcEventSymbols = [...new Set(
+                events
+                    .filter(event => {
+                        const values = [
+                            event?.symbol,
+                            event?.name,
+                            event?.description,
+                            event?.event_details?.eventName,
+                            event?.event_details?.metaData?.NAME,
+                            event?.event_details?.metaData?.UNDERLYING,
+                            event?.event_details?.metaData?.ASSET,
+                            event?.event_details?.metaData?.TICKER
+                        ].filter(Boolean);
+                        return values.some(isBtcText);
+                    })
+                    .map(event => event?.symbol)
+                    .filter(Boolean)
+            )];
+
+            for (const symbol of pageBtcEventSymbols) {
+                btcEventSymbolSet.add(symbol);
+            }
+
+            const nextCursor = eventResult?.next_cursor || null;
+
+            eventPages.push({
+                page: eventPage + 1,
+                httpStatus: eventResponse.status,
+                responseCode: eventBody?.code ?? null,
+                responseMessage: eventBody?.message ?? null,
+                eventsReturned: events.length,
+                btcEventsReturned: pageBtcEventSymbols.length,
+                btcEventsFoundTotal: btcEventSymbolSet.size,
+                nextCursor: nextCursor ? String(nextCursor) : null
+            });
+
+            eventPage += 1;
+
+            if (!nextCursor || seenEventCursors.has(String(nextCursor))) {
+                eventCursor = null;
+            } else {
+                seenEventCursors.add(String(nextCursor));
+                eventCursor = nextCursor;
+            }
+        } while (
+            eventCursor &&
+            eventPage < maxEventPages &&
+            btcEventSymbolSet.size === 0
         );
 
-        const eventBody = eventResponse.data;
-        const eventResult = eventBody?.result || {};
-        const events = Array.isArray(eventResult.data)
-            ? eventResult.data
-            : [];
-
-        const btcEventSymbols = [...new Set(
-            events
-                .filter(event => {
-                    const values = [
-                        event?.symbol,
-                        event?.name,
-                        event?.description,
-                        event?.event_details?.eventName,
-                        event?.event_details?.metaData?.NAME,
-                        event?.event_details?.metaData?.UNDERLYING,
-                        event?.event_details?.metaData?.ASSET,
-                        event?.event_details?.metaData?.TICKER
-                    ].filter(Boolean);
-                    return values.some(isBtcText);
-                })
-                .map(event => event?.symbol)
-                .filter(Boolean)
-        )];
-
-        eventPages.push({
-            httpStatus: eventResponse.status,
-            responseCode: eventBody?.code ?? null,
-            responseMessage: eventBody?.message ?? null,
-            eventsReturned: events.length,
-            btcEventsReturned: btcEventSymbols.length,
-            nextCursor: eventResult?.next_cursor || null
-        });
+        const btcEventSymbols = [...btcEventSymbolSet];
 
         if (!btcEventSymbols.length) {
             state.dcmHttpDiagnostics = {
