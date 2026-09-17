@@ -47,7 +47,8 @@ const state = {
     btcContractsSeen: 0,
     instrumentsSeen: 0,
     btcBinaryInstrumentsSeen: 0,
-    dcmDiagnostics: null
+    dcmDiagnostics: null,
+    predictionDiagnostics: null
 };
 
 let timer = null;
@@ -613,11 +614,25 @@ async function pollPredictionApi() {
     state.btcEventsSeen = events.filter(looksLikeBtcEvent).length;
 
     const candidates = [];
+    const rejectionCounts = {
+        btcEvents: 0,
+        contractsExamined: 0,
+        textOrDurationMismatch: 0,
+        missingOpenTime: 0,
+        missingCloseTime: 0,
+        durationOutside10To20Minutes: 0,
+        notCurrentByTime: 0,
+        missingStrike: 0,
+        usable: 0
+    };
+    const rejectedSample = [];
 
     for (const event of events) {
         if (!looksLikeBtcEvent(event)) {
             continue;
         }
+
+        rejectionCounts.btcEvents += 1;
 
         const eventId = event?.id || event?.event_id || event?.eventId;
         let contracts = getContractsFromEvent(event);
@@ -636,11 +651,54 @@ async function pollPredictionApi() {
         }
 
         for (const contract of contracts) {
+            rejectionCounts.contractsExamined += 1;
+
             const market = normalizePredictionMarket(event, contract, now);
             const textMatch = looksLikeCrypto15MinuteMarket(event, contract);
+            const reasons = [];
 
             if (!textMatch && market.durationMinutes !== 15) {
-                continue;
+                rejectionCounts.textOrDurationMismatch += 1;
+                reasons.push('TEXT_OR_DURATION_MISMATCH');
+            }
+
+            if (market.openTimestampMs == null) {
+                rejectionCounts.missingOpenTime += 1;
+                reasons.push('MISSING_OPEN_TIME');
+            }
+
+            if (market.closeTimestampMs == null) {
+                rejectionCounts.missingCloseTime += 1;
+                reasons.push('MISSING_CLOSE_TIME');
+            }
+
+            if (
+                market.durationMs != null &&
+                (
+                    market.durationMs < CONFIG.minimumDurationMs ||
+                    market.durationMs > CONFIG.maximumDurationMs
+                )
+            ) {
+                rejectionCounts.durationOutside10To20Minutes += 1;
+                reasons.push('DURATION_OUTSIDE_10_TO_20_MINUTES');
+            }
+
+            if (
+                market.openTimestampMs != null &&
+                market.closeTimestampMs != null &&
+                !isCurrent15m(
+                    market.openTimestampMs,
+                    market.closeTimestampMs,
+                    now
+                )
+            ) {
+                rejectionCounts.notCurrentByTime += 1;
+                reasons.push('NOT_CURRENT_BY_TIME');
+            }
+
+            if (market.strike === null) {
+                rejectionCounts.missingStrike += 1;
+                reasons.push('MISSING_STRIKE');
             }
 
             const candidate = {
@@ -649,14 +707,42 @@ async function pollPredictionApi() {
                 is15mText: textMatch
             };
 
-            if (!candidateIsUsable(candidate, now)) {
+            if (
+                reasons.length === 0 &&
+                candidateIsUsable(candidate, now)
+            ) {
+                rejectionCounts.usable += 1;
+                candidate.selectionScore = scoreCandidate(candidate, now);
+                candidates.push(candidate);
                 continue;
             }
 
-            candidate.selectionScore = scoreCandidate(candidate, now);
-            candidates.push(candidate);
+            if (rejectedSample.length < 10) {
+                rejectedSample.push({
+                    eventId: market.eventId,
+                    eventTitle: event?.title || event?.name || null,
+                    eventStatus: event?.status || null,
+                    contractId: market.contractId,
+                    symbol: market.symbol,
+                    contractTitle: contract?.title || contract?.name || null,
+                    contractStatus: contract?.status || null,
+                    openTime: market.openTime,
+                    closeTime: market.closeTime,
+                    durationMinutes: market.durationMinutes,
+                    strike: market.strike,
+                    operator: market.strikeOperator,
+                    textMatch,
+                    reasons
+                });
+            }
         }
     }
+
+    state.predictionDiagnostics = {
+        generatedAt: new Date(now).toISOString(),
+        rejectionCounts,
+        rejectedSample
+    };
 
     candidates.sort((a, b) => b.selectionScore - a.selectionScore);
 
@@ -900,6 +986,10 @@ async function poll() {
             console.log(`Prediction events scanned: ${state.eventsSeen}`);
             console.log(`BTC events found: ${state.btcEventsSeen}`);
             console.log(`Contracts scanned: ${state.contractsSeen}`);
+            if (state.predictionDiagnostics) {
+                console.log(`Predictions rejection summary: ${JSON.stringify(state.predictionDiagnostics.rejectionCounts)}`);
+                console.log(`Predictions rejected BTC sample: ${JSON.stringify(state.predictionDiagnostics.rejectedSample)}`);
+            }
             console.log(`DCM instruments scanned: ${state.instrumentsSeen}`);
             console.log(`DCM BTC binary matches: ${state.btcBinaryInstrumentsSeen}`);
             if (state.dcmDiagnostics) {
