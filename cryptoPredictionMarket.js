@@ -46,7 +46,8 @@ const state = {
     btcEventsSeen: 0,
     btcContractsSeen: 0,
     instrumentsSeen: 0,
-    btcBinaryInstrumentsSeen: 0
+    btcBinaryInstrumentsSeen: 0,
+    dcmDiagnostics: null
 };
 
 let timer = null;
@@ -663,24 +664,67 @@ async function pollPredictionApi() {
 }
 
 async function fetchDcmInstruments() {
-    const response = await axios.get(
-        `${CONFIG.dcmBaseUrl}/public/get-instruments`,
-        {
-            params: {
-                inst_type: 'BINARY_OPTION',
-                limit: 1000
-            },
-            timeout: CONFIG.requestTimeoutMs,
-            headers: { Accept: 'application/json' }
-        }
-    );
+    /*
+     * DCM is cursor-paginated. Reading only the first page can make the
+     * active BTC 15-minute contract disappear whenever it lands on a later
+     * page. Walk every available page so contract discovery does not depend
+     * on the server's current result ordering.
+     */
+    const instruments = [];
+    const seenCursors = new Set();
+    let cursor = null;
+    let page = 0;
+    const maxPages = 50;
 
-    return (
-        response.data?.result?.data ||
-        response.data?.result?.instruments ||
-        response.data?.data ||
-        []
-    );
+    do {
+        const params = {
+            inst_type: 'BINARY_OPTION',
+            limit: 1000,
+            since: 0
+        };
+
+        if (cursor) {
+            params.cursor = cursor;
+        }
+
+        const response = await axios.get(
+            `${CONFIG.dcmBaseUrl}/public/get-instruments`,
+            {
+                params,
+                timeout: CONFIG.requestTimeoutMs,
+                headers: { Accept: 'application/json' }
+            }
+        );
+
+        const result = response.data?.result || {};
+        const pageData =
+            result.data ||
+            result.instruments ||
+            response.data?.data ||
+            [];
+
+        if (Array.isArray(pageData)) {
+            instruments.push(...pageData);
+        }
+
+        const nextCursor =
+            result.next_cursor ||
+            result.nextCursor ||
+            response.data?.next_cursor ||
+            response.data?.nextCursor ||
+            null;
+
+        page += 1;
+
+        if (!nextCursor || seenCursors.has(String(nextCursor))) {
+            cursor = null;
+        } else {
+            seenCursors.add(String(nextCursor));
+            cursor = nextCursor;
+        }
+    } while (cursor && page < maxPages);
+
+    return instruments;
 }
 
 function dcmLooksLikeBtc(instrument) {
@@ -756,20 +800,46 @@ async function pollDcmFallback() {
             instrument => dcmIsBinaryOption(instrument) && dcmLooksLikeBtc(instrument)
         ).length;
 
+        const diagnostics = {
+            notTradable: 0,
+            notBinary: 0,
+            notBtc: 0,
+            notCurrent15m: 0,
+            noStrike: 0
+        };
+
         const candidates = instruments
             .filter(instrument => {
-                if (!instrument?.tradable) return false;
-                if (!dcmIsBinaryOption(instrument)) return false;
-                if (!dcmLooksLikeBtc(instrument)) return false;
+                if (!instrument?.tradable) {
+                    diagnostics.notTradable += 1;
+                    return false;
+                }
+                if (!dcmIsBinaryOption(instrument)) {
+                    diagnostics.notBinary += 1;
+                    return false;
+                }
+                if (!dcmLooksLikeBtc(instrument)) {
+                    diagnostics.notBtc += 1;
+                    return false;
+                }
 
                 const market = normalizeDcmMarket(instrument, now);
 
-                return (
-                    isCurrent15m(market.openTimestampMs, market.closeTimestampMs, now) &&
-                    market.strike !== null
-                );
+                if (!isCurrent15m(market.openTimestampMs, market.closeTimestampMs, now)) {
+                    diagnostics.notCurrent15m += 1;
+                    return false;
+                }
+
+                if (market.strike === null) {
+                    diagnostics.noStrike += 1;
+                    return false;
+                }
+
+                return true;
             })
             .map(instrument => normalizeDcmMarket(instrument, now));
+
+        state.dcmDiagnostics = diagnostics;
 
         candidates.sort((a, b) => {
             const ad = a.durationMs == null ? Infinity : Math.abs(a.durationMs - CONFIG.targetDurationMs);
@@ -830,6 +900,11 @@ async function poll() {
             console.log(`Prediction events scanned: ${state.eventsSeen}`);
             console.log(`BTC events found: ${state.btcEventsSeen}`);
             console.log(`Contracts scanned: ${state.contractsSeen}`);
+            console.log(`DCM instruments scanned: ${state.instrumentsSeen}`);
+            console.log(`DCM BTC binary matches: ${state.btcBinaryInstrumentsSeen}`);
+            if (state.dcmDiagnostics) {
+                console.log(`DCM rejection summary: ${JSON.stringify(state.dcmDiagnostics)}`);
+            }
             console.log('Decision: WAITING FOR AN ACTUAL CONTRACT + STRIKE');
             console.log('========================================');
         }
@@ -885,6 +960,7 @@ function getStatus() {
         btcContractsSeen: state.btcContractsSeen,
         instrumentsSeen: state.instrumentsSeen,
         btcBinaryInstrumentsSeen: state.btcBinaryInstrumentsSeen,
+        dcmDiagnostics: state.dcmDiagnostics,
         market: state.activeMarket
     };
 }
