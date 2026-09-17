@@ -2073,6 +2073,78 @@ function saveCompletedRound(
 
 /*
 ============================================================
+        RETIRE EXPIRED ROUND WHILE FEED IS WAITING
+============================================================
+*/
+
+function retireExpiredCurrentRound() {
+
+    const round =
+        engineState.currentRound;
+
+
+    if (
+        !round
+    ) {
+        return false;
+    }
+
+
+    const closeMs =
+        parseTimestampMs(
+            round.closeTimestampMs ??
+            round.closeTime ??
+            null
+        );
+
+
+    if (
+        closeMs === null ||
+        Date.now() < closeMs
+    ) {
+        return false;
+    }
+
+
+    /*
+    Preserve the full completed round before removing it from
+    the live/current slot. This keeps the 70% previous-round
+    input available even when Crypto.com has a gap before the
+    next contract appears.
+    */
+    if (
+        round.samples?.length
+    ) {
+
+        const completedRoundSnapshot =
+            buildRoundDecisionSnapshot(
+                round
+            );
+
+
+        if (
+            completedRoundSnapshot
+        ) {
+
+            saveCompletedRound(
+                completedRoundSnapshot
+            );
+        }
+    }
+
+
+    engineState.currentRound =
+        null;
+
+    engineState.currentConfirmation =
+        null;
+
+    return true;
+}
+
+
+/*
+============================================================
               GET PREVIOUS ROUND
 ============================================================
 */
@@ -3753,7 +3825,13 @@ async function engineTick() {
 
         const activeCryptoMarket =
             cryptoMarket ||
-            engineState.cryptoMarket;
+            (
+                isCryptoMarketUsable(
+                    engineState.cryptoMarket
+                )
+                    ? engineState.cryptoMarket
+                    : null
+            );
 
 
         /*
@@ -3767,6 +3845,18 @@ async function engineTick() {
                 activeCryptoMarket
             )
         ) {
+
+            retireExpiredCurrentRound();
+
+            if (
+                engineState.cryptoMarket &&
+                !isCryptoMarketUsable(
+                    engineState.cryptoMarket
+                )
+            ) {
+                engineState.cryptoMarket =
+                    null;
+            }
 
             let waitingReason =
                 'CRYPTO_COM_CONTRACT_UNAVAILABLE';
@@ -4454,7 +4544,20 @@ app.get(
 
         const cryptoMarket =
             liveCryptoMarket ||
-            engineState.cryptoMarket;
+            (
+                isCryptoMarketUsable(
+                    engineState.cryptoMarket
+                )
+                    ? engineState.cryptoMarket
+                    : null
+            );
+
+
+        if (
+            !cryptoMarket
+        ) {
+            retireExpiredCurrentRound();
+        }
 
 
         res.json({
@@ -4788,7 +4891,13 @@ app.get(
 
         const market =
             liveMarket ||
-            engineState.cryptoMarket;
+            (
+                isCryptoMarketUsable(
+                    engineState.cryptoMarket
+                )
+                    ? engineState.cryptoMarket
+                    : null
+            );
 
 
         res.json({
@@ -4860,7 +4969,20 @@ app.get(
 
         const activeMarket =
             market ||
-            engineState.cryptoMarket;
+            (
+                isCryptoMarketUsable(
+                    engineState.cryptoMarket
+                )
+                    ? engineState.cryptoMarket
+                    : null
+            );
+
+
+        if (
+            !activeMarket
+        ) {
+            retireExpiredCurrentRound();
+        }
 
 
         const round =
