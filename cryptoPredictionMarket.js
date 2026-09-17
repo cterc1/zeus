@@ -54,6 +54,8 @@ const state = {
 };
 
 let timer = null;
+let pollInFlight = false;
+let skippedOverlappingPolls = 0;
 
 // Render can advertise both IPv6 and IPv4 routes for api.crypto.com even when
 // IPv6 egress is unavailable. Keep DCM traffic on IPv4 so a dead IPv6 route
@@ -778,7 +780,10 @@ async function fetchDcmInstruments() {
     const pages = [];
     const eventPages = [];
     const now = Date.now();
-    const dcmTimeoutMs = Math.max(CONFIG.requestTimeoutMs, 20000);
+    // Keep each DCM attempt short. The connector is polled continuously, so a
+    // failed request should release the poll lock quickly instead of holding it
+    // for a minute or more while nested retries/pages accumulate.
+    const dcmTimeoutMs = 8000;
     const recentLookbackMs = 48 * 60 * 60 * 1000;
     const recentSinceNs = Math.floor((now - recentLookbackMs) * 1e6);
 
@@ -798,7 +803,7 @@ async function fetchDcmInstruments() {
     async function getWithRetry(url, params, label) {
         let lastError = null;
 
-        for (let attempt = 1; attempt <= 3; attempt += 1) {
+        for (let attempt = 1; attempt <= 2; attempt += 1) {
             try {
                 const response = await axios.get(url, {
                     params,
@@ -831,14 +836,15 @@ async function fetchDcmInstruments() {
                     /timeout|timed out|ETIMEDOUT|ENETUNREACH|ECONNRESET|EAI_AGAIN/i.test(message) ||
                     Number(error?.response?.status) >= 500;
 
-                if (!retryable || attempt >= 3) {
+                if (!retryable || attempt >= 2) {
                     error.dcmLabel = label;
                     error.dcmAttempt = attempt;
                     throw error;
                 }
 
-                // Short bounded backoff: 500 ms before retry 2, 1.5 s before retry 3.
-                const retryDelayMs = attempt === 1 ? 500 : 1500;
+                // One short retry. Future poll cycles provide additional retries without
+                // trapping pollInFlight for a long period.
+                const retryDelayMs = 500;
                 await new Promise(resolve => setTimeout(resolve, retryDelayMs));
             }
         }
@@ -904,9 +910,14 @@ async function fetchDcmInstruments() {
 
         state.dcmHttpDiagnostics.recentPages = recentPages;
 
-        // If the recent binary feed returned data, let the existing strict BTC,
-        // 15-minute, tradable and strike filters decide whether it is usable.
-        if (instruments.length) {
+        // Only stop on the fast path when it actually found at least one BTC
+        // binary instrument. A page full of non-BTC binaries must not suppress
+        // the BTC event fallback.
+        const recentBtcBinaryCount = instruments.filter(
+            instrument => dcmIsBinaryOption(instrument) && dcmLooksLikeBtc(instrument)
+        ).length;
+
+        if (recentBtcBinaryCount > 0) {
             state.dcmHttpDiagnostics = {
                 ...state.dcmHttpDiagnostics,
                 recentPages,
@@ -918,6 +929,10 @@ async function fetchDcmInstruments() {
             };
             return instruments;
         }
+
+        // Do not mix irrelevant recent non-BTC instruments into the fallback
+        // result/diagnostics. The event path below is now authoritative.
+        instruments.length = 0;
 
         // Secondary path: discover BTC events and fetch their instruments.
         const eventWindowMs = 6 * 60 * 60 * 1000;
@@ -1244,7 +1259,24 @@ async function pollDcmFallback() {
 }
 
 async function poll() {
+    // A DCM request can legitimately take longer than the 5-second schedule.
+    // Never allow another poll to start while one is still running; otherwise
+    // Render accumulates overlapping Crypto.com requests and duplicate log blocks.
+    if (pollInFlight) {
+        skippedOverlappingPolls += 1;
+        return;
+    }
+
+    pollInFlight = true;
     state.lastPollAt = new Date().toISOString();
+
+    // Print immediately, before any remote await. This makes a live connector
+    // distinguishable from a request that is still waiting on Crypto.com.
+    console.log('');
+    console.log('========== CRYPTO.COM MARKET =========');
+    console.log(`Poll started: ${state.lastPollAt}`);
+    console.log('Status: CHECKING CRYPTO.COM FOR CURRENT BTC 15-MINUTE CONTRACT');
+
     state.contractsSeen = 0;
     state.btcContractsSeen = 0;
 
@@ -1272,8 +1304,6 @@ async function poll() {
         if (market) {
             state.lastError = null;
 
-            console.log('');
-            console.log('========== CRYPTO.COM MARKET =========');
             console.log(`Source: ${market.source}`);
             console.log(`Contract: ${market.symbol || market.contractId || 'UNKNOWN'}`);
             console.log(`Title: ${market.title || market.displayName || 'UNKNOWN'}`);
@@ -1284,8 +1314,6 @@ async function poll() {
             console.log(`Strike Available: ${market.strikeAvailable ? 'YES' : 'NO'}`);
             console.log('========================================');
         } else {
-            console.log('');
-            console.log('========== CRYPTO.COM MARKET =========');
             console.log('Status: ACTIVE BTC 15-MINUTE CONTRACT NOT FOUND');
             console.log(`Prediction events scanned: ${state.eventsSeen}`);
             console.log(`BTC events found: ${state.btcEventsSeen}`);
@@ -1313,6 +1341,8 @@ async function poll() {
         };
 
         console.error('Crypto.com market-data error:', error.message);
+    } finally {
+        pollInFlight = false;
     }
 }
 
