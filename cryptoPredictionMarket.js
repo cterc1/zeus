@@ -752,112 +752,159 @@ async function pollPredictionApi() {
 
 async function fetchDcmInstruments() {
     /*
-     * DIAGNOSTIC-ONLY instrumentation for the DCM fallback.
-     * This does not alter Zeus contract-selection rules. It records the
-     * response shape/status so an empty DCM result can be diagnosed safely.
+     * Targeted DCM fallback.
+     *
+     * Crypto.com's current DCM documentation supports filtering instruments by
+     * event_symbols. Pulling the complete binary-option catalog from since=0
+     * can be very large and was timing out on Render. We first ask DCM for
+     * events near the current time, keep only BTC events, then request
+     * instruments for those event symbols in batches of 10.
      */
     const instruments = [];
-    const seenCursors = new Set();
     const pages = [];
-    let cursor = null;
-    let page = 0;
-    const maxPages = 50;
+    const eventPages = [];
+    const now = Date.now();
+    const eventWindowMs = 6 * 60 * 60 * 1000;
+    const lowerEventNs = Math.floor((now - eventWindowMs) * 1e6);
+    const upperEventNs = Math.floor((now + eventWindowMs) * 1e6);
 
     state.dcmHttpDiagnostics = {
+        strategy: 'BTC_EVENT_FILTERED_INSTRUMENT_LOOKUP',
+        eventsEndpoint: `${CONFIG.dcmBaseUrl}/public/get-events`,
         endpoint: `${CONFIG.dcmBaseUrl}/public/get-instruments`,
+        eventPages: [],
+        btcEventSymbols: [],
         pages: [],
         totalInstruments: 0,
         error: null
     };
 
     try {
-        do {
-            const params = {
-                inst_type: 'BINARY_OPTION',
-                limit: 1000,
-                since: 0
+        const eventResponse = await axios.get(
+            `${CONFIG.dcmBaseUrl}/public/get-events`,
+            {
+                params: {
+                    limit: 100,
+                    event_date: lowerEventNs,
+                    event_end_date: upperEventNs
+                },
+                timeout: CONFIG.requestTimeoutMs,
+                headers: {
+                    Accept: 'application/json',
+                    'Content-Type': 'application/json'
+                }
+            }
+        );
+
+        const eventBody = eventResponse.data;
+        const eventResult = eventBody?.result || {};
+        const events = Array.isArray(eventResult.data)
+            ? eventResult.data
+            : [];
+
+        const btcEventSymbols = [...new Set(
+            events
+                .filter(event => {
+                    const values = [
+                        event?.symbol,
+                        event?.name,
+                        event?.description,
+                        event?.event_details?.eventName,
+                        event?.event_details?.metaData?.NAME,
+                        event?.event_details?.metaData?.UNDERLYING,
+                        event?.event_details?.metaData?.ASSET,
+                        event?.event_details?.metaData?.TICKER
+                    ].filter(Boolean);
+                    return values.some(isBtcText);
+                })
+                .map(event => event?.symbol)
+                .filter(Boolean)
+        )];
+
+        eventPages.push({
+            httpStatus: eventResponse.status,
+            responseCode: eventBody?.code ?? null,
+            responseMessage: eventBody?.message ?? null,
+            eventsReturned: events.length,
+            btcEventsReturned: btcEventSymbols.length,
+            nextCursor: eventResult?.next_cursor || null
+        });
+
+        if (!btcEventSymbols.length) {
+            state.dcmHttpDiagnostics = {
+                ...state.dcmHttpDiagnostics,
+                eventPages,
+                btcEventSymbols,
+                pages,
+                totalInstruments: 0,
+                error: null
             };
+            return [];
+        }
 
-            if (cursor) {
-                params.cursor = cursor;
-            }
+        for (let offset = 0; offset < btcEventSymbols.length; offset += 10) {
+            const batch = btcEventSymbols.slice(offset, offset + 10);
+            const seenCursors = new Set();
+            let cursor = null;
+            let page = 0;
+            const maxPages = 20;
 
-            const response = await axios.get(
-                `${CONFIG.dcmBaseUrl}/public/get-instruments`,
-                {
-                    params,
-                    timeout: CONFIG.requestTimeoutMs,
-                    headers: { Accept: 'application/json' }
+            do {
+                const params = {
+                    event_symbols: batch.join(','),
+                    inst_type: 'BINARY_OPTION',
+                    limit: 1000
+                };
+
+                if (cursor) {
+                    params.cursor = cursor;
                 }
-            );
 
-            const body = response.data;
-            const result = body?.result || {};
-            const pageData =
-                result.data ||
-                result.instruments ||
-                body?.data ||
-                [];
+                const response = await axios.get(
+                    `${CONFIG.dcmBaseUrl}/public/get-instruments`,
+                    {
+                        params,
+                        timeout: CONFIG.requestTimeoutMs,
+                        headers: {
+                            Accept: 'application/json',
+                            'Content-Type': 'application/json'
+                        }
+                    }
+                );
 
-            const responseKeys =
-                body && typeof body === 'object' && !Array.isArray(body)
-                    ? Object.keys(body)
+                const body = response.data;
+                const result = body?.result || {};
+                const pageData = Array.isArray(result.data)
+                    ? result.data
                     : [];
-            const resultKeys =
-                result && typeof result === 'object' && !Array.isArray(result)
-                    ? Object.keys(result)
-                    : [];
+                const nextCursor = result?.next_cursor || null;
 
-            const nextCursor =
-                result.next_cursor ||
-                result.nextCursor ||
-                body?.next_cursor ||
-                body?.nextCursor ||
-                null;
+                pages.push({
+                    batch: batch.join(','),
+                    page: page + 1,
+                    httpStatus: response.status,
+                    responseCode: body?.code ?? null,
+                    responseMessage: body?.message ?? null,
+                    pageInstrumentCount: pageData.length,
+                    nextCursor: nextCursor ? String(nextCursor) : null
+                });
 
-            const rawSample = (() => {
-                try {
-                    const source = Array.isArray(pageData) && pageData.length
-                        ? pageData[0]
-                        : body;
-                    const text = JSON.stringify(source);
-                    return text.length > 1800
-                        ? `${text.slice(0, 1800)}...<truncated>`
-                        : text;
-                } catch {
-                    return '[UNSERIALIZABLE_RESPONSE]';
-                }
-            })();
-
-            pages.push({
-                page: page + 1,
-                httpStatus: response.status,
-                responseKeys,
-                resultKeys,
-                responseCode: body?.code ?? body?.id ?? null,
-                responseMessage: body?.message ?? body?.msg ?? null,
-                pageInstrumentCount: Array.isArray(pageData) ? pageData.length : 0,
-                pageDataType: Array.isArray(pageData) ? 'array' : typeof pageData,
-                nextCursor: nextCursor ? String(nextCursor) : null,
-                sample: rawSample
-            });
-
-            if (Array.isArray(pageData)) {
                 instruments.push(...pageData);
-            }
+                page += 1;
 
-            page += 1;
-
-            if (!nextCursor || seenCursors.has(String(nextCursor))) {
-                cursor = null;
-            } else {
-                seenCursors.add(String(nextCursor));
-                cursor = nextCursor;
-            }
-        } while (cursor && page < maxPages);
+                if (!nextCursor || seenCursors.has(String(nextCursor))) {
+                    cursor = null;
+                } else {
+                    seenCursors.add(String(nextCursor));
+                    cursor = nextCursor;
+                }
+            } while (cursor && page < maxPages);
+        }
 
         state.dcmHttpDiagnostics = {
-            endpoint: `${CONFIG.dcmBaseUrl}/public/get-instruments`,
+            ...state.dcmHttpDiagnostics,
+            eventPages,
+            btcEventSymbols,
             pages,
             totalInstruments: instruments.length,
             error: null
@@ -878,17 +925,16 @@ async function fetchDcmInstruments() {
         }
 
         state.dcmHttpDiagnostics = {
-            endpoint: `${CONFIG.dcmBaseUrl}/public/get-instruments`,
+            ...state.dcmHttpDiagnostics,
+            eventPages,
             pages,
             totalInstruments: instruments.length,
             error: {
                 message: error.message,
+                requestUrl: error?.config?.url || null,
+                requestParams: error?.config?.params || null,
                 httpStatus: error?.response?.status ?? null,
-                responseKeys:
-                    body && typeof body === 'object' && !Array.isArray(body)
-                        ? Object.keys(body)
-                        : [],
-                responseCode: body?.code ?? body?.id ?? null,
+                responseCode: body?.code ?? null,
                 responseMessage: body?.message ?? body?.msg ?? null,
                 sample
             }
