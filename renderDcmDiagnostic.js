@@ -4,59 +4,57 @@ const dns = require('dns').promises;
 const net = require('net');
 const tls = require('tls');
 const https = require('https');
-const axios = require('axios');
 
 const HOST = 'api.crypto.com';
 const PORT = 443;
-const BASE = 'https://api.crypto.com/dcm/v1';
-const TIMEOUT_MS = 8000;
+const PATH = '/dcm/v1/public/get-instruments?inst_type=BINARY_OPTION&limit=1';
+const STEP_TIMEOUT_MS = 8000;
 
 function elapsed(start) {
     return `${Date.now() - start}ms`;
 }
 
-async function dnsTest() {
-    console.log('\n[1/4] DNS');
-    const start = Date.now();
-    try {
-        const all = await dns.lookup(HOST, { all: true });
-        console.log(`PASS ${elapsed(start)}`);
-        console.log(JSON.stringify(all, null, 2));
-        return all;
-    } catch (error) {
-        console.log(`FAIL ${elapsed(start)} code=${error.code || 'NONE'} message=${error.message}`);
-        return [];
-    }
+function withTimeout(promise, label, timeoutMs = STEP_TIMEOUT_MS) {
+    return Promise.race([
+        promise,
+        new Promise((_, reject) => {
+            const timer = setTimeout(() => {
+                const error = new Error(`${label} timed out after ${timeoutMs}ms`);
+                error.code = 'DIAGNOSTIC_TIMEOUT';
+                reject(error);
+            }, timeoutMs);
+            timer.unref?.();
+        })
+    ]);
 }
 
-function tcpTest(address) {
-    return new Promise(resolve => {
-        console.log(`\n[2/4] TCP IPv4 ${address}:${PORT}`);
-        const start = Date.now();
-        const socket = net.createConnection({ host: address, port: PORT, family: 4 });
-        let done = false;
+async function testTcp(address) {
+    const started = Date.now();
 
-        function finish(ok, detail) {
-            if (done) return;
-            done = true;
+    await withTimeout(new Promise((resolve, reject) => {
+        const socket = net.createConnection({
+            host: address,
+            port: PORT,
+            family: 4
+        });
+
+        const finish = error => {
+            socket.removeAllListeners();
             socket.destroy();
-            console.log(`${ok ? 'PASS' : 'FAIL'} ${elapsed(start)} ${detail}`);
-            resolve(ok);
-        }
+            error ? reject(error) : resolve();
+        };
 
-        socket.setTimeout(TIMEOUT_MS);
-        socket.once('connect', () => finish(true, 'connected'));
-        socket.once('timeout', () => finish(false, 'timeout'));
-        socket.once('error', error =>
-            finish(false, `code=${error.code || 'NONE'} message=${error.message}`)
-        );
-    });
+        socket.once('connect', () => finish());
+        socket.once('error', finish);
+    }), `TCP IPv4 ${address}:${PORT}`);
+
+    return elapsed(started);
 }
 
-function tlsTest(address) {
-    return new Promise(resolve => {
-        console.log(`\n[3/4] TLS IPv4 ${address}:${PORT}`);
-        const start = Date.now();
+async function testTls(address) {
+    const started = Date.now();
+
+    const result = await withTimeout(new Promise((resolve, reject) => {
         const socket = tls.connect({
             host: address,
             port: PORT,
@@ -64,64 +62,90 @@ function tlsTest(address) {
             servername: HOST,
             rejectUnauthorized: true
         });
-        let done = false;
 
-        function finish(ok, detail) {
-            if (done) return;
-            done = true;
+        const finish = (error, value) => {
+            socket.removeAllListeners();
             socket.destroy();
-            console.log(`${ok ? 'PASS' : 'FAIL'} ${elapsed(start)} ${detail}`);
-            resolve(ok);
-        }
+            error ? reject(error) : resolve(value);
+        };
 
-        socket.setTimeout(TIMEOUT_MS);
-        socket.once('secureConnect', () =>
-            finish(true, `authorized=${socket.authorized} protocol=${socket.getProtocol()}`)
-        );
-        socket.once('timeout', () => finish(false, 'timeout'));
-        socket.once('error', error =>
-            finish(false, `code=${error.code || 'NONE'} message=${error.message}`)
-        );
-    });
+        socket.once('secureConnect', () => {
+            finish(null, {
+                authorized: socket.authorized,
+                protocol: socket.getProtocol()
+            });
+        });
+        socket.once('error', error => finish(error));
+    }), `TLS IPv4 ${address}:${PORT}`);
+
+    return {
+        elapsed: elapsed(started),
+        ...result
+    };
 }
 
-async function httpTest() {
-    console.log('\n[4/4] DCM HTTPS GET forced IPv4');
-    const start = Date.now();
-    const agent = new https.Agent({
-        family: 4,
-        keepAlive: false
-    });
+async function testHttps() {
+    const started = Date.now();
 
-    try {
-        const response = await axios.get(`${BASE}/public/get-instruments`, {
-            params: {
-                inst_type: 'BINARY_OPTION',
-                limit: 1
-            },
-            timeout: TIMEOUT_MS,
-            httpsAgent: agent,
-            headers: {
-                Accept: 'application/json'
-            },
-            validateStatus: () => true
+    const result = await withTimeout(new Promise((resolve, reject) => {
+        const agent = new https.Agent({
+            family: 4,
+            keepAlive: false
         });
 
-        console.log(`PASS ${elapsed(start)} HTTP=${response.status}`);
-        console.log(`CryptoCode=${response.data?.code ?? 'NONE'} Message=${response.data?.message ?? 'NONE'}`);
-        return true;
-    } catch (error) {
-        console.log(
-            `FAIL ${elapsed(start)} code=${error.code || 'NONE'} ` +
-            `HTTP=${error.response?.status ?? 'NONE'} message=${error.message}`
-        );
-        return false;
-    } finally {
-        agent.destroy();
-    }
+        const request = https.get({
+            hostname: HOST,
+            port: PORT,
+            path: PATH,
+            method: 'GET',
+            family: 4,
+            agent,
+            headers: {
+                Accept: 'application/json',
+                'User-Agent': 'Zeus-DCM-Diagnostic/1.0'
+            }
+        }, response => {
+            let body = '';
+
+            response.setEncoding('utf8');
+            response.on('data', chunk => {
+                if (body.length < 4000) body += chunk;
+            });
+            response.on('end', () => {
+                agent.destroy();
+
+                let parsed = null;
+                try {
+                    parsed = JSON.parse(body);
+                } catch {
+                    // Keep parsed null; HTTP status is still useful.
+                }
+
+                resolve({
+                    httpStatus: response.statusCode,
+                    cryptoCode: parsed?.code ?? null,
+                    message: parsed?.message ?? parsed?.msg ?? null
+                });
+            });
+        });
+
+        request.setTimeout(STEP_TIMEOUT_MS, () => {
+            request.destroy(new Error(`HTTPS request timed out after ${STEP_TIMEOUT_MS}ms`));
+        });
+        request.once('error', error => {
+            agent.destroy();
+            reject(error);
+        });
+    }), 'DCM HTTPS GET forced IPv4');
+
+    return {
+        elapsed: elapsed(started),
+        ...result
+    };
 }
 
-async function main() {
+async function runDiagnostic() {
+    console.log('');
     console.log('==================================================');
     console.log(' ZEUS RENDER -> CRYPTO.COM DCM NETWORK DIAGNOSTIC');
     console.log('==================================================');
@@ -129,35 +153,78 @@ async function main() {
     console.log(`Node: ${process.version}`);
     console.log(`Host: ${HOST}`);
     console.log('READ-ONLY. NO ORDER/TRADING ACTIONS.');
+    console.log('');
 
-    const addresses = await dnsTest();
-    const ipv4 = addresses.filter(item => item.family === 4);
+    let addresses = [];
+    let httpResponseReceived = false;
 
-    if (!ipv4.length) {
-        console.log('\nRESULT: DNS returned no IPv4 address. Stop here.');
-        process.exitCode = 2;
-        return;
+    try {
+        const started = Date.now();
+        addresses = await withTimeout(
+            dns.resolve4(HOST),
+            'DNS IPv4 lookup'
+        );
+        console.log('[1/4] DNS');
+        console.log(`PASS ${elapsed(started)}`);
+        console.log(JSON.stringify(addresses.map(address => ({ address, family: 4 })), null, 2));
+    } catch (error) {
+        console.log('[1/4] DNS');
+        console.log(`FAIL code=${error.code || 'UNKNOWN'} message=${error.message}`);
     }
 
-    // Test up to two addresses so one bad edge address does not mislead us.
-    for (const item of ipv4.slice(0, 2)) {
-        await tcpTest(item.address);
-        await tlsTest(item.address);
+    for (const address of addresses.slice(0, 2)) {
+        try {
+            const timing = await testTcp(address);
+            console.log(`\n[2/4] TCP IPv4 ${address}:${PORT}`);
+            console.log(`PASS ${timing} connected`);
+        } catch (error) {
+            console.log(`\n[2/4] TCP IPv4 ${address}:${PORT}`);
+            console.log(`FAIL code=${error.code || 'UNKNOWN'} message=${error.message}`);
+        }
+
+        try {
+            const result = await testTls(address);
+            console.log(`\n[3/4] TLS IPv4 ${address}:${PORT}`);
+            console.log(`PASS ${result.elapsed} authorized=${result.authorized} protocol=${result.protocol || 'UNKNOWN'}`);
+        } catch (error) {
+            console.log(`\n[3/4] TLS IPv4 ${address}:${PORT}`);
+            console.log(`FAIL code=${error.code || 'UNKNOWN'} message=${error.message}`);
+        }
     }
 
-    const httpOk = await httpTest();
+    try {
+        const result = await testHttps();
+        httpResponseReceived = true;
+        console.log('\n[4/4] DCM HTTPS GET forced IPv4');
+        console.log(`PASS ${result.elapsed} HTTP=${result.httpStatus}`);
+        console.log(`CryptoCode=${result.cryptoCode ?? 'NONE'} Message=${result.message ?? 'NONE'}`);
+    } catch (error) {
+        console.log('\n[4/4] DCM HTTPS GET forced IPv4');
+        console.log(`FAIL code=${error.code || 'UNKNOWN'} message=${error.message}`);
+    }
 
-    console.log('\n==================================================');
+    console.log('');
+    console.log('==================================================');
     console.log(' DIAGNOSTIC COMPLETE');
     console.log('==================================================');
     console.log(
-        httpOk
-            ? 'RESULT: Render received an HTTP response from Crypto.com DCM.'
-            : 'RESULT: Render did not receive an HTTP response from Crypto.com DCM.'
+        httpResponseReceived
+            ? 'RESULT: This host received an HTTP response from Crypto.com DCM.'
+            : 'RESULT: This host did NOT receive an HTTP response from Crypto.com DCM.'
     );
+    console.log('==================================================');
+    console.log('');
+
+    return { httpResponseReceived, addresses };
 }
 
-main().catch(error => {
-    console.error('FATAL:', error);
-    process.exitCode = 1;
-});
+if (require.main === module) {
+    runDiagnostic().catch(error => {
+        console.error('Diagnostic crashed:', error);
+        process.exitCode = 1;
+    });
+}
+
+module.exports = {
+    runDiagnostic
+};

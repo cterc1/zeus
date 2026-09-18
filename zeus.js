@@ -7,6 +7,7 @@ const path = require('path');
 
 const marketData = require('./marketData');
 const cryptoPredictionMarket = require('./cryptoPredictionMarket');
+const { runDiagnostic: runRenderDcmDiagnostic } = require('./renderDcmDiagnostic');
 
 const {
     calculateProbability
@@ -4344,6 +4345,24 @@ async function startEngine() {
     */
 
     marketData.start();
+
+
+    /*
+    Run one read-only Crypto.com DCM network diagnostic at startup.
+    This prints DNS/TCP/TLS/HTTPS results directly into Render logs, so
+    the Free plan does not need an interactive shell for diagnosis.
+    A failed diagnostic does NOT stop Zeus; the normal connector still
+    starts immediately afterward and keeps its own retry/poll behavior.
+    */
+
+    try {
+        await runRenderDcmDiagnostic();
+    } catch (error) {
+        console.error(
+            'Startup DCM diagnostic failed:',
+            error.message
+        );
+    }
 
 
     /*
