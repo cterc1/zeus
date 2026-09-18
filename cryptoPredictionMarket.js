@@ -788,7 +788,7 @@ async function fetchDcmInstruments() {
     const recentSinceNs = Math.floor((now - recentLookbackMs) * 1e6);
 
     state.dcmHttpDiagnostics = {
-        strategy: 'RECENT_BINARY_INSTRUMENTS_THEN_BTC_EVENT_FALLBACK',
+        strategy: 'BOUNDED_RECENT_BINARY_THEN_BTC_EVENT_FALLBACK',
         eventsEndpoint: `${CONFIG.dcmBaseUrl}/public/get-events`,
         endpoint: `${CONFIG.dcmBaseUrl}/public/get-instruments`,
         recentSinceNs,
@@ -860,13 +860,13 @@ async function fetchDcmInstruments() {
         const seenRecentCursors = new Set();
         let recentCursor = null;
         let recentPage = 0;
-        const maxRecentPages = 10;
+        const maxRecentPages = 25;
 
         do {
             const params = {
                 inst_type: 'BINARY_OPTION',
                 since: recentSinceNs,
-                limit: 1000
+                limit: 100
             };
 
             if (recentCursor) {
@@ -900,7 +900,18 @@ async function fetchDcmInstruments() {
             instruments.push(...pageData);
             recentPage += 1;
 
-            if (!nextCursor || seenRecentCursors.has(String(nextCursor))) {
+            // The only purpose of this path is to locate the live BTC binary
+            // family. Once a page contains one, stop paging immediately and
+            // let the strict current-15m + strike filters below decide whether
+            // it is usable. This avoids downloading thousands of unrelated
+            // binary instruments on Render.
+            const pageHasBtcBinary = pageData.some(
+                instrument => dcmIsBinaryOption(instrument) && dcmLooksLikeBtc(instrument)
+            );
+
+            if (pageHasBtcBinary) {
+                recentCursor = null;
+            } else if (!nextCursor || seenRecentCursors.has(String(nextCursor))) {
                 recentCursor = null;
             } else {
                 seenRecentCursors.add(String(nextCursor));
@@ -1042,7 +1053,7 @@ async function fetchDcmInstruments() {
                 const params = {
                     event_symbols: batch.join(','),
                     inst_type: 'BINARY_OPTION',
-                    limit: 1000
+                    limit: 100
                 };
 
                 if (cursor) {
