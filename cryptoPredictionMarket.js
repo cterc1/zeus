@@ -900,16 +900,22 @@ async function fetchDcmInstruments() {
             instruments.push(...pageData);
             recentPage += 1;
 
-            // The only purpose of this path is to locate the live BTC binary
-            // family. Once a page contains one, stop paging immediately and
-            // let the strict current-15m + strike filters below decide whether
-            // it is usable. This avoids downloading thousands of unrelated
-            // binary instruments on Render.
-            const pageHasBtcBinary = pageData.some(
-                instrument => dcmIsBinaryOption(instrument) && dcmLooksLikeBtc(instrument)
-            );
+            // Do not stop merely because a page contains BTC binaries. DCM can
+            // return older BTC binary contracts before the live 15-minute family.
+            // Stop only when this page contains a BTC binary that already passes
+            // the same strict current-window + strike checks used by Zeus.
+            const pageHasUsableCurrentBtc = pageData.some(instrument => {
+                if (!instrument?.tradable) return false;
+                if (!dcmIsBinaryOption(instrument) || !dcmLooksLikeBtc(instrument)) return false;
 
-            if (pageHasBtcBinary) {
+                const market = normalizeDcmMarket(instrument, now);
+                return (
+                    isCurrent15m(market.openTimestampMs, market.closeTimestampMs, now) &&
+                    market.strike !== null
+                );
+            });
+
+            if (pageHasUsableCurrentBtc) {
                 recentCursor = null;
             } else if (!nextCursor || seenRecentCursors.has(String(nextCursor))) {
                 recentCursor = null;
@@ -921,14 +927,21 @@ async function fetchDcmInstruments() {
 
         state.dcmHttpDiagnostics.recentPages = recentPages;
 
-        // Only stop on the fast path when it actually found at least one BTC
-        // binary instrument. A page full of non-BTC binaries must not suppress
-        // the BTC event fallback.
-        const recentBtcBinaryCount = instruments.filter(
-            instrument => dcmIsBinaryOption(instrument) && dcmLooksLikeBtc(instrument)
-        ).length;
+        // Older BTC binaries are not enough. Return from the fast path only
+        // when at least one instrument is the live 10-20 minute BTC binary and
+        // exposes a strike. Otherwise continue to the BTC-event fallback.
+        const recentUsableCurrentBtcCount = instruments.filter(instrument => {
+            if (!instrument?.tradable) return false;
+            if (!dcmIsBinaryOption(instrument) || !dcmLooksLikeBtc(instrument)) return false;
 
-        if (recentBtcBinaryCount > 0) {
+            const market = normalizeDcmMarket(instrument, now);
+            return (
+                isCurrent15m(market.openTimestampMs, market.closeTimestampMs, now) &&
+                market.strike !== null
+            );
+        }).length;
+
+        if (recentUsableCurrentBtcCount > 0) {
             state.dcmHttpDiagnostics = {
                 ...state.dcmHttpDiagnostics,
                 recentPages,
